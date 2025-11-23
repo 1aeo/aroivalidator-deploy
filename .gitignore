@@ -1,0 +1,17 @@
+# Environment config (contains personal settings)
+config.env
+
+# Data files
+logs/
+public/*.json
+public/files.json
+public/archives/
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+Thumbs.db

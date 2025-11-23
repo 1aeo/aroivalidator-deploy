@@ -1,0 +1,78 @@
+# Caddy Configuration for AROI Validator
+# Configured for Cloudflare Flexible SSL (HTTP-only origin)
+# Cloudflare handles HTTPS to visitors, communicates with server via HTTP
+
+http://${DEPLOY_DOMAIN} {
+    # Bind to specific IP
+    bind ${DEPLOY_IP}
+    
+    # Serve files from public directory
+    root * ${DEPLOY_DIR}/public
+    
+    # Enable file server with directory browsing
+    file_server browse
+    
+    # Index page fallback
+    try_files {path} /index.html
+    
+    # Enable compression
+    encode gzip
+    
+    # Security headers (all files)
+    header {
+        # Prevent clickjacking
+        X-Frame-Options "SAMEORIGIN"
+        # XSS Protection
+        X-XSS-Protection "1; mode=block"
+        # Prevent MIME type sniffing
+        X-Content-Type-Options "nosniff"
+        # Referrer policy
+        Referrer-Policy "strict-origin-when-cross-origin"
+        # Remove server header
+        -Server
+    }
+    
+    # HTML files - no caching (always fresh)
+    @html {
+        path *.html /
+    }
+    header @html {
+        Cache-Control "no-cache, no-store, must-revalidate"
+    }
+    
+    # latest.json - special handling (updates hourly, use cache-busting in JS)
+    @latest {
+        path /latest.json
+    }
+    header @latest {
+        Content-Type application/json
+        Cache-Control "public, max-age=60, s-maxage=60"
+    }
+    
+    # files.json - manifest file (short cache)
+    @manifest {
+        path /files.json
+    }
+    header @manifest {
+        Content-Type application/json
+        Cache-Control "public, max-age=300"
+    }
+    
+    # Historical JSON files - long cache (immutable)
+    @historical {
+        path /aroi_validation_*.json
+    }
+    header @historical {
+        Content-Type application/json
+        Cache-Control "public, max-age=86400, immutable"
+    }
+    
+    # Archive files - very long cache (never change)
+    @archives {
+        path /archives/*.tar.gz
+    }
+    header @archives {
+        Cache-Control "public, max-age=2592000, immutable"
+    }
+}
+

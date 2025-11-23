@@ -1,0 +1,4 @@
+# AROI Validator - Hourly batch validation
+# Run validation every hour at minute 5
+5 * * * * ${DEPLOY_DIR}/scripts/run-batch-validation.sh >> ${DEPLOY_DIR}/logs/cron.log 2>&1
+

@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="AROI Validator - Automated validation of Authenticated Relay Operator IDs">
+    <title>AROI Validator - Tor Relay Verification Results</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: Arial, sans-serif;
+            background-color: #121212;
+            color: #ffffff;
+            line-height: 1.6;
+            min-height: 100vh;
+            margin: 0;
+            padding: 0;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 2rem;
+        }
+
+        header {
+            text-align: center;
+            padding: 3rem 0;
+            border-bottom: 2px solid #00ff7f;
+            margin-bottom: 3rem;
+        }
+
+        h1 {
+            font-size: 2.5rem;
+            margin-bottom: 0.5rem;
+            color: #00ff7f;
+            font-weight: bold;
+        }
+
+        .subtitle {
+            color: #00ff7f;
+            font-size: 1.1rem;
+            margin-bottom: 1rem;
+        }
+
+        .description {
+            max-width: 800px;
+            margin: 0 auto;
+            color: #cccccc;
+            font-size: 18px;
+            line-height: 1.6;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 1.5rem;
+            margin: 2rem 0;
+        }
+
+        .stat-card {
+            background: #1e1e1e;
+            border: 1px solid #00ff7f;
+            border-radius: 10px;
+            padding: 1.5rem;
+            transition: transform 0.2s, box-shadow 0.2s;
+            box-shadow: 0 0 10px rgba(0, 255, 127, 0.3);
+        }
+
+        .stat-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 0 15px rgba(0, 255, 127, 0.6);
+        }
+
+        .stat-label {
+            color: #00ff7f;
+            font-size: 0.9rem;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 0.5rem;
+        }
+
+        .stat-value {
+            color: #fff;
+            font-size: 2rem;
+            font-weight: bold;
+        }
+
+        .section {
+            background: #1e1e1e;
+            border: 1px dashed #00ff7f;
+            border-radius: 10px;
+            padding: 2rem;
+            margin: 2rem 0;
+            box-shadow: 0 0 10px rgba(0, 255, 127, 0.3);
+        }
+
+        h2 {
+            color: #00ff7f;
+            margin-bottom: 1rem;
+            font-size: 1.8rem;
+            font-weight: bold;
+        }
+
+        .file-list {
+            list-style: none;
+            padding: 0;
+        }
+
+        .file-item {
+            background: #1e1e1e;
+            border: 1px solid #00ff7f;
+            border-radius: 8px;
+            padding: 1rem;
+            margin: 0.5rem 0;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            transition: background 0.2s, box-shadow 0.2s;
+        }
+
+        .file-item:hover {
+            background: #252525;
+            box-shadow: 0 0 10px rgba(0, 255, 127, 0.4);
+        }
+
+        .file-name {
+            color: #ffffff;
+            font-weight: 500;
+        }
+
+        .file-meta {
+            color: #cccccc;
+            font-size: 0.9rem;
+        }
+
+        a {
+            color: #00ff7f;
+            text-decoration: none;
+            transition: color 0.2s;
+        }
+
+        a:hover {
+            text-decoration: underline;
+        }
+
+        .button {
+            display: inline-block;
+            background-color: #00ff7f;
+            color: #121212;
+            padding: 0.75rem 1.5rem;
+            border-radius: 5px;
+            text-decoration: none;
+            font-weight: bold;
+            transition: background 0.3s, transform 0.2s;
+            border: none;
+            cursor: pointer;
+        }
+
+        .button:hover {
+            background-color: #00cc66;
+            transform: translateY(-2px);
+        }
+
+        .info-box {
+            background: rgba(0, 255, 127, 0.1);
+            border-left: 4px solid #00ff7f;
+            padding: 1rem;
+            border-radius: 4px;
+            margin: 1rem 0;
+        }
+
+        .loading {
+            text-align: center;
+            color: #cccccc;
+            padding: 2rem;
+        }
+        
+        p {
+            font-size: 18px;
+            color: #cccccc;
+        }
+
+        footer {
+            text-align: center;
+            padding: 2rem 0;
+            margin-top: 3rem;
+            border-top: 1px solid #00ff7f;
+            color: #777777;
+            font-size: 14px;
+        }
+
+        .footer-link {
+            color: #00ff7f;
+            margin: 0 0.5rem;
+        }
+
+        .update-time {
+            color: #cccccc;
+            font-size: 0.9rem;
+            margin-top: 0.5rem;
+        }
+
+        @media (max-width: 768px) {
+            h1 {
+                font-size: 2rem;
+            }
+            
+            .stats-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .container {
+                padding: 1rem;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🛡️ AROI Validator</h1>
+            <p class="subtitle">Authenticated Relay Operator ID Verification</p>
+            <p class="description">
+                Automated hourly validation of Authenticated Relay Operator IDs (AROIs) from the Tor network. 
+                Verifies relay operator identity proofs using DNS-RSA and URI-RSA cryptographic validation methods.
+            </p>
+        </header>
+
+        <div class="section">
+            <h2>📊 Latest Validation Results</h2>
+            
+            <div class="stats-grid" id="stats" style="margin-bottom: 2rem;">
+                <div class="stat-card">
+                    <div class="stat-label">Total Relays</div>
+                    <div class="stat-value" id="total-relays">--</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Relays with Valid Proofs</div>
+                    <div class="stat-value" id="valid-relays">--</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Relay Proof Success Rate</div>
+                    <div class="stat-value" id="success-rate">--%</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Last Updated</div>
+                    <div class="stat-value" style="font-size: 1rem;" id="last-updated">--</div>
+                </div>
+            </div>
+            
+            <p style="display: flex; gap: 1rem; flex-wrap: wrap;">
+                <a href="latest.json" class="button" target="_blank">👁️ View JSON</a>
+                <a href="latest.json" class="button" download>⬇️ Download JSON</a>
+            </p>
+            
+            <p style="color: #7986cb; font-size: 0.85rem; margin-top: 1.5rem; text-align: center;" id="validation-timestamp">
+                Loading timestamp...
+            </p>
+        </div>
+
+        <div class="section">
+            <h2>📁 Historical Results Archive</h2>
+            <p style="color: #cccccc; margin-bottom: 1rem;">
+                Browse all validation results. Each file contains complete metadata, statistics, 
+                and detailed validation results for individual relays.
+            </p>
+            <ul class="file-list" id="file-list">
+                <li class="loading">Loading results...</li>
+            </ul>
+        </div>
+
+        <div class="section">
+            <h2>ℹ️ About AROI Validation</h2>
+            <p style="color: #cccccc;">
+                Authenticated Relay Operator IDs (AROIs) enable Tor relay operators to cryptographically 
+                prove ownership of their contact information. This validator automatically checks these 
+                proofs to verify relay operator authenticity and build trust in the Tor network.
+            </p>
+            <p style="color: #cccccc; margin-top: 1rem;">
+                <strong>Validation Methods:</strong>
+            </p>
+            <ul style="color: #cccccc; margin-left: 2rem; margin-top: 0.5rem;">
+                <li><strong>dns-rsa:</strong> DNSSEC-signed TXT record verification</li>
+                <li><strong>uri-rsa:</strong> URI-based RSA signature validation</li>
+            </ul>
+            <p style="color: #cccccc; margin-top: 1rem; font-size: 0.9rem;">
+                Learn more about the 
+                <a href="https://nusenu.github.io/tor-relay-operator-ids-trust-information/" target="_blank">
+                    AROI framework and trust methodology
+                </a>
+            </p>
+        </div>
+
+        <footer>
+            <p>
+                <a href="https://github.com/1aeo/AROIValidator" class="footer-link" target="_blank">
+                    GitHub Repository
+                </a>
+                |
+                <a href="https://nusenu.github.io/tor-relay-operator-ids-trust-information/" class="footer-link" target="_blank">
+                    AROI Methodology
+                </a>
+                |
+                <a href="https://1aeo.com" class="footer-link" target="_blank">
+                    1st Amendment Encrypted Openness
+                </a>
+            </p>
+            <p style="margin-top: 0.5rem; font-size: 0.85rem;">
+                Automated validation runs hourly. Data sourced from Tor Onionoo API.
+            </p>
+        </footer>
+    </div>
+
+    <script>
+        // Load and display latest results
+        async function loadLatestResults() {
+            try {
+                // Add cache-busting parameter to ensure fresh data
+                const response = await fetch('latest.json?t=' + Date.now());
+                const data = await response.json();
+                
+                // Update stats
+                document.getElementById('total-relays').textContent = 
+                    data.metadata?.total_relays || '--';
+                document.getElementById('valid-relays').textContent = 
+                    data.metadata?.valid_relays || '--';
+                
+                const successRate = data.metadata?.success_rate || 0;
+                document.getElementById('success-rate').textContent = 
+                    successRate.toFixed(1) + '%';
+                
+                const timestamp = data.metadata?.timestamp;
+                if (timestamp) {
+                    const date = new Date(timestamp);
+                    
+                    // Show date and time on same line in Last Updated card
+                    const shortDate = date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+                    const timeWithZone = date.toLocaleTimeString('en-US', { 
+                        hour: 'numeric', 
+                        minute: '2-digit',
+                        timeZoneName: 'short'
+                    });
+                    document.getElementById('last-updated').textContent = 
+                        shortDate + ' ' + timeWithZone;
+                    
+                    // Update detailed timestamp at bottom of section
+                    document.getElementById('validation-timestamp').textContent = 
+                        'Validation completed: ' + date.toLocaleString('en-US', { 
+                            dateStyle: 'full', 
+                            timeStyle: 'long' 
+                        });
+                }
+            } catch (error) {
+                console.error('Error loading latest results:', error);
+                document.getElementById('validation-timestamp').textContent = 
+                    'Error loading latest results';
+            }
+        }
+
+        // Pagination state
+        let currentPage = 0;
+        const filesPerPage = 10;
+        let allFiles = [];
+
+        // Load and display all JSON files with pagination
+        async function loadFileList() {
+            const fileList = document.getElementById('file-list');
+            
+            try {
+                // Fetch file manifest (already sorted newest first)
+                const response = await fetch('files.json');
+                allFiles = await response.json();
+                
+                if (!allFiles || allFiles.length === 0) {
+                    fileList.innerHTML = `
+                        <li class="file-item">
+                            <div>
+                                <div class="file-name">📂 Historical Results</div>
+                                <div class="file-meta">Results will appear here after hourly validation runs</div>
+                            </div>
+                        </li>
+                    `;
+                    return;
+                }
+                
+                displayPage(0);
+            } catch (error) {
+                console.error('Error loading file list:', error);
+                fileList.innerHTML = `
+                    <li class="file-item">
+                        <div class="file-name">📂 Historical Results</div>
+                        <div class="file-meta">Check back after hourly validation runs</div>
+                    </div>
+                    </li>
+                `;
+            }
+        }
+
+        // Display a specific page of results
+        function displayPage(page) {
+            const fileList = document.getElementById('file-list');
+            const start = page * filesPerPage;
+            const end = start + filesPerPage;
+            const pageFiles = allFiles.slice(start, end);
+            const totalPages = Math.ceil(allFiles.length / filesPerPage);
+            
+            currentPage = page;
+            
+            // Display files
+            let html = pageFiles.map(filename => {
+                // Extract date from filename: aroi_validation_YYYYMMDD_HHMMSS.json
+                const match = filename.match(/(\d{8})_(\d{6})/);
+                let displayDate = filename;
+                
+                if (match) {
+                    const dateStr = match[1];
+                    const timeStr = match[2];
+                    
+                    // Parse into Date object
+                    const year = dateStr.slice(0,4);
+                    const month = dateStr.slice(4,6);
+                    const day = dateStr.slice(6,8);
+                    const hour = timeStr.slice(0,2);
+                    const min = timeStr.slice(2,4);
+                    const sec = timeStr.slice(4,6);
+                    
+                    // Create Date object (assumes UTC/server timezone)
+                    const dateObj = new Date(`${year}-${month}-${day}T${hour}:${min}:${sec}`);
+                    
+                    // Format with AM/PM and timezone
+                    const datePart = `${year}-${month}-${day}`;
+                    const timePart = dateObj.toLocaleTimeString('en-US', {
+                        hour: 'numeric',
+                        minute: '2-digit',
+                        second: '2-digit',
+                        timeZoneName: 'short'
+                    });
+                    
+                    displayDate = `${datePart} ${timePart}`;
+                }
+                
+                return `
+                    <li class="file-item">
+                        <div>
+                            <div class="file-name">${displayDate}</div>
+                            <div class="file-meta">${filename}</div>
+                        </div>
+                        <div style="display: flex; gap: 0.5rem;">
+                            <a href="${filename}" class="button" target="_blank" style="padding: 0.5rem 1rem; font-size: 0.9rem;">👁️ View</a>
+                            <a href="${filename}" class="button" download style="padding: 0.5rem 1rem; font-size: 0.9rem;">⬇️ Download</a>
+                        </div>
+                    </li>
+                `;
+            }).join('');
+            
+            // Add pagination controls if needed
+            if (totalPages > 1) {
+                html += `
+                    <li class="file-item" style="margin-top: 1rem; border: 1px solid #00ff7f; justify-content: center;">
+                        <div style="display: flex; gap: 1rem; align-items: center;">
+                            <button class="button" ${page === 0 ? 'disabled' : ''} 
+                                    onclick="displayPage(${page - 1})" 
+                                    style="padding: 0.5rem 1rem; font-size: 0.9rem; ${page === 0 ? 'opacity: 0.5; cursor: not-allowed;' : ''}">
+                                ← Previous
+                            </button>
+                            <span style="color: #00ff7f;">
+                                Page ${page + 1} of ${totalPages} (${allFiles.length} total results)
+                            </span>
+                            <button class="button" ${page === totalPages - 1 ? 'disabled' : ''} 
+                                    onclick="displayPage(${page + 1})"
+                                    style="padding: 0.5rem 1rem; font-size: 0.9rem; ${page === totalPages - 1 ? 'opacity: 0.5; cursor: not-allowed;' : ''}">
+                                Next →
+                            </button>
+                        </div>
+                    </li>
+                `;
+            }
+            
+            fileList.innerHTML = html;
+        }
+
+        // Initialize page
+        document.addEventListener('DOMContentLoaded', () => {
+            loadLatestResults();
+            loadFileList();
+            
+            // Refresh stats every 60 seconds
+            setInterval(loadLatestResults, 60000);
+        });
+    </script>
+</body>
+</html>

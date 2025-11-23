@@ -1,0 +1,116 @@
+#!/bin/bash
+# AROI Validator - Monthly Data Compression
+# Compresses validation files 180+ days old and large logs
+
+set -euo pipefail
+
+# Auto-detect paths
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEPLOY_DIR="$(dirname "$SCRIPT_DIR")"
+PUBLIC_DIR="$DEPLOY_DIR/public"
+LOG_DIR="$DEPLOY_DIR/logs"
+
+echo "========================================="
+echo "Data Compression - $(date)"
+echo "========================================="
+
+# Check available disk space (need at least 5GB free for safety)
+AVAILABLE=$(df -BG "$DEPLOY_DIR" | tail -1 | awk '{print $4}' | tr -d 'G')
+if [ "$AVAILABLE" -lt 5 ]; then
+    echo "ERROR: Less than 5GB free disk space. Aborting."
+    exit 1
+fi
+
+# Create archives directories
+mkdir -p "$PUBLIC_DIR/archives" "$LOG_DIR/archives"
+chmod 755 "$PUBLIC_DIR/archives" "$LOG_DIR/archives"
+
+# === COMPRESS VALIDATION FILES (180+ days old) ===
+echo "Checking for validation files 180+ days old..."
+
+# Get list of months with old files
+MONTHS_TO_COMPRESS=$(find "$PUBLIC_DIR" -maxdepth 1 -name "aroi_validation_*.json" -mtime +180 -type f 2>/dev/null | \
+    sed 's/.*aroi_validation_\([0-9]\{6\}\).*/\1/' | sort -u)
+
+if [ -n "$MONTHS_TO_COMPRESS" ]; then
+    for MONTH in $MONTHS_TO_COMPRESS; do
+        ARCHIVE_NAME="aroi-$MONTH.tar.gz"
+        ARCHIVE_PATH="$PUBLIC_DIR/archives/$ARCHIVE_NAME"
+        
+        echo "Processing month: $MONTH"
+        
+        # Find all files for this month
+        FILES_TO_COMPRESS=$(find "$PUBLIC_DIR" -maxdepth 1 -name "aroi_validation_${MONTH}*.json" -mtime +180 -type f 2>/dev/null)
+        
+        if [ -n "$FILES_TO_COMPRESS" ]; then
+            FILE_COUNT=$(echo "$FILES_TO_COMPRESS" | wc -l)
+            echo "  Found $FILE_COUNT files for $MONTH"
+            
+            # Create archive with all files for this month
+            tar czf "$ARCHIVE_PATH" -C "$PUBLIC_DIR" $(echo "$FILES_TO_COMPRESS" | xargs -n1 basename) 2>/dev/null
+            
+            # Verify archive was created and contains files
+            if [ -f "$ARCHIVE_PATH" ] && tar tzf "$ARCHIVE_PATH" >/dev/null 2>&1; then
+                # Archive verified, safe to delete originals
+                echo "$FILES_TO_COMPRESS" | xargs -r rm -f
+                chmod 644 "$ARCHIVE_PATH"
+                echo "  ✓ Compressed $FILE_COUNT files → $ARCHIVE_NAME"
+            else
+                echo "  ✗ Archive verification failed, keeping originals"
+                rm -f "$ARCHIVE_PATH"
+            fi
+        fi
+    done
+else
+    echo "No files older than 180 days found"
+fi
+
+# === COMPRESS CRON LOG (if > 50 MB) ===
+echo "Checking cron.log size..."
+
+if [ -f "$LOG_DIR/cron.log" ]; then
+    LOG_SIZE=$(stat -c%s "$LOG_DIR/cron.log" 2>/dev/null || echo 0)
+    LOG_SIZE_MB=$((LOG_SIZE / 1048576))
+    
+    if [ "$LOG_SIZE_MB" -gt 50 ]; then
+        ARCHIVE_NAME="cron-$(date +%Y-%m).log.gz"
+        
+        echo "cron.log is ${LOG_SIZE_MB}MB, compressing..."
+        
+        # Compress entire log
+        gzip -9 -c "$LOG_DIR/cron.log" > "$LOG_DIR/archives/$ARCHIVE_NAME"
+        
+        # Verify compression
+        if [ -f "$LOG_DIR/archives/$ARCHIVE_NAME" ] && gunzip -t "$LOG_DIR/archives/$ARCHIVE_NAME" 2>/dev/null; then
+            # Keep only last 500 lines in current log
+            tail -500 "$LOG_DIR/cron.log" > "$LOG_DIR/cron.log.new"
+            mv "$LOG_DIR/cron.log.new" "$LOG_DIR/cron.log"
+            chmod 644 "$LOG_DIR/archives/$ARCHIVE_NAME"
+            echo "  ✓ Compressed to $ARCHIVE_NAME"
+        else
+            echo "  ✗ Compression verification failed"
+            rm -f "$LOG_DIR/archives/$ARCHIVE_NAME"
+        fi
+    else
+        echo "cron.log is ${LOG_SIZE_MB}MB (under 50MB threshold)"
+    fi
+fi
+
+# === UPDATE FILES MANIFEST ===
+echo "Updating file manifest..."
+
+# List current uncompressed files (sorted newest first)
+cd "$PUBLIC_DIR" || exit 1
+ls -1 aroi_validation_*.json 2>/dev/null | sort -r | jq -R -s 'split("\n") | map(select(length > 0))' > files.json || echo '[]' > files.json
+
+# Add archives to manifest
+if [ -d archives ] && ls archives/*.tar.gz >/dev/null 2>&1; then
+    # List archives and merge with main list
+    (echo '{"files":'; cat files.json; echo ',"archives":'; ls -1 archives/*.tar.gz | jq -R -s 'split("\n") | map(select(length > 0))'; echo '}') | jq '{files: .files, archives: .archives}' > files.json.new 2>/dev/null && mv files.json.new files.json || echo '[]' > files.json
+fi
+
+chmod 644 files.json 2>/dev/null || true
+
+echo "Compression completed at $(date)"
+echo ""
+
