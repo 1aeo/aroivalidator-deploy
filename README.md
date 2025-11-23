@@ -2,6 +2,7 @@
 
 Automated Tor relay validation with web interface. Validates ~11,000 relays hourly.
 
+**Live example:** https://aroivalidator.1aeo.com  
 **Code repo:** https://github.com/1aeo/AROIValidator
 
 ---
