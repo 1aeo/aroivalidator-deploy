@@ -87,8 +87,29 @@ envsubst < "$DEPLOY_DIR/configs/Caddyfile.template" > /etc/caddy/Caddyfile
 CRON_HOURLY=$(envsubst < "$DEPLOY_DIR/configs/aroivalidator.cron.template")
 CRON_MONTHLY=$(envsubst < "$DEPLOY_DIR/configs/monthly-compression.cron.template")
 
-# Install cron jobs
-(sudo -u $ACTUAL_USER crontab -l 2>/dev/null | grep -v "aroivalidator\|compress-old-data"; echo "$CRON_HOURLY"; echo "$CRON_MONTHLY") | sudo -u $ACTUAL_USER crontab -
+# Install cron jobs (amend, not overwrite)
+CURRENT_CRON=$(sudo -u $ACTUAL_USER crontab -l 2>/dev/null || echo "")
+CRON_CHANGED=false
+
+if ! echo "$CURRENT_CRON" | grep -q "run-batch-validation.sh"; then
+    CURRENT_CRON="$CURRENT_CRON"$'\n'"$CRON_HOURLY"
+    CRON_CHANGED=true
+    echo -e "${GREEN}  + Added hourly validation cron${NC}"
+else
+    echo -e "${GREEN}  ✓ Hourly validation cron already exists${NC}"
+fi
+
+if ! echo "$CURRENT_CRON" | grep -q "compress-old-data.sh"; then
+    CURRENT_CRON="$CURRENT_CRON"$'\n'"$CRON_MONTHLY"
+    CRON_CHANGED=true
+    echo -e "${GREEN}  + Added monthly compression cron${NC}"
+else
+    echo -e "${GREEN}  ✓ Monthly compression cron already exists${NC}"
+fi
+
+if [ "$CRON_CHANGED" = true ]; then
+    echo "$CURRENT_CRON" | grep -v '^$' | sudo -u $ACTUAL_USER crontab -
+fi
 echo -e "${GREEN}✓ Cron jobs configured${NC}"
 
 # Set permissions
