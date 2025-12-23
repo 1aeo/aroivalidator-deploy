@@ -1,154 +1,191 @@
 #!/bin/bash
-# AROI Validator - Simplified Installation
-# Run with: sudo bash install.sh
+# AROI Validator - Installation Script
+# Default: Cloudflare Pages + DO Spaces/R2
+# Fallback: Caddy (self-hosted)
 
 set -e
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-BLUE='\033[0;34m'
-NC='\033[0m'
+RED='\033[0;31m'; GREEN='\033[0;32m'; BLUE='\033[0;34m'; YELLOW='\033[1;33m'; NC='\033[0m'
+log() { echo -e "${BLUE}[$(date '+%H:%M:%S')]${NC} $1"; }
+ok() { echo -e "${GREEN}✓${NC} $1"; }
+warn() { echo -e "${YELLOW}⚠${NC} $1"; }
+err() { echo -e "${RED}✗${NC} $1"; exit 1; }
 
-echo -e "${BLUE}╔════════════════════════════════════════════════════════════╗${NC}"
-echo -e "${BLUE}║         AROI Validator - Installation                     ║${NC}"
-echo -e "${BLUE}╚════════════════════════════════════════════════════════════╝${NC}"
+echo ""
+echo -e "${BLUE}╔═══════════════════════════════════════════════════════════════╗${NC}"
+echo -e "${BLUE}║           AROI Validator - Installation                       ║${NC}"
+echo -e "${BLUE}╚═══════════════════════════════════════════════════════════════╝${NC}"
 echo ""
 
-# Check if running as root
-if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}Error: Must run as root (use sudo)${NC}"
-    exit 1
+# Detect user and paths
+if [[ $EUID -eq 0 ]]; then
+    ACTUAL_USER=${SUDO_USER:-$(logname 2>/dev/null || echo $USER)}
+else
+    ACTUAL_USER=$USER
 fi
-
-# Auto-detect user and paths
-ACTUAL_USER=${SUDO_USER:-$(logname 2>/dev/null || echo $USER)}
 USER_HOME=$(eval echo ~$ACTUAL_USER)
 DEPLOY_DIR="$USER_HOME/aroivalidator-deploy"
 CODE_DIR="$USER_HOME/aroivalidator"
 
-# Load configuration
-if [ ! -f "$DEPLOY_DIR/config.env" ]; then
-    echo -e "${RED}Error: config.env not found${NC}"
-    echo "Please copy config.env.example to config.env and edit it"
-    exit 1
-fi
-
+# Load config
+[[ -f "$DEPLOY_DIR/config.env" ]] || err "config.env not found. Copy config.env.example first."
 source "$DEPLOY_DIR/config.env"
 
-# Validate configuration
-echo -e "${BLUE}[1/7] Validating configuration...${NC}"
-if [[ ! "$DEPLOY_IP" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-    echo -e "${RED}Error: Invalid DEPLOY_IP in config.env${NC}"
-    exit 1
-fi
-if [ -z "$DEPLOY_DOMAIN" ] || [ "$DEPLOY_DOMAIN" = "your-subdomain.your-domain.com" ]; then
-    echo -e "${RED}Error: Please set DEPLOY_DOMAIN in config.env${NC}"
-    exit 1
-fi
-echo -e "${GREEN}✓ Configuration valid${NC}"
+# Determine mode
+USE_PAGES=false
+USE_CADDY=false
 
-# Install system packages
-echo -e "${BLUE}[2/7] Installing system packages...${NC}"
-apt-get update -qq
-apt-get install -y -qq python3-venv debian-keyring apt-transport-https curl gettext-base > /dev/null 2>&1
+if [[ "${1:-}" == "--caddy" ]]; then
+    USE_CADDY=true
+    log "Mode: Caddy (self-hosted)"
+elif [[ -n "${CLOUDFLARE_API_TOKEN:-}" && "${CLOUDFLARE_API_TOKEN}" != "your_api_token" ]]; then
+    USE_PAGES=true
+    log "Mode: Cloudflare Pages + DO Spaces/R2"
+elif [[ -n "${DEPLOY_IP:-}" && "${DEPLOY_IP}" != "YOUR_IP_ADDRESS" ]]; then
+    USE_CADDY=true
+    log "Mode: Caddy (fallback - no Cloudflare token)"
+else
+    err "Configure either CLOUDFLARE_API_TOKEN (Pages) or DEPLOY_IP (Caddy) in config.env"
+fi
 
-# Install Caddy
-if ! command -v caddy &> /dev/null; then
-    echo -e "${BLUE}[3/7] Installing Caddy...${NC}"
-    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg 2>/dev/null
-    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list > /dev/null
+# === Common Setup ===
+log "Installing dependencies..."
+if [[ $EUID -eq 0 ]]; then
     apt-get update -qq
-    apt-get install -y -qq caddy > /dev/null 2>&1
-    echo -e "${GREEN}✓ Caddy installed${NC}"
+    apt-get install -y -qq python3-venv curl jq gettext-base > /dev/null 2>&1
+    ok "System packages"
 else
-    echo -e "${GREEN}✓ Caddy already installed${NC}"
+    command -v python3 &>/dev/null || err "python3 required"
+    command -v curl &>/dev/null || err "curl required"
+    command -v jq &>/dev/null || err "jq required"
+    ok "Dependencies found"
 fi
 
-# Set up Python environment
-echo -e "${BLUE}[4/7] Setting up Python environment...${NC}"
-if [ -d "$CODE_DIR/venv" ] && [ ! -f "$CODE_DIR/venv/bin/pip" ]; then
-    rm -rf "$CODE_DIR/venv"
+# Python environment
+log "Setting up Python..."
+[[ -d "$CODE_DIR" ]] || err "Code directory not found: $CODE_DIR"
+[[ -d "$CODE_DIR/venv" && ! -f "$CODE_DIR/venv/bin/pip" ]] && rm -rf "$CODE_DIR/venv"
+[[ -d "$CODE_DIR/venv" ]] || python3 -m venv "$CODE_DIR/venv"
+source "$CODE_DIR/venv/bin/activate"
+pip install -q --upgrade pip
+pip install -q streamlit dnspython pandas requests urllib3
+ok "Python environment"
+
+# Create directories
+mkdir -p "$DEPLOY_DIR"/{logs,public,backups,pages-static}
+[[ -f "$DEPLOY_DIR/public/index.html" ]] && cp -f "$DEPLOY_DIR/public/index.html" "$DEPLOY_DIR/pages-static/"
+ok "Directories"
+
+# === Mode-specific Setup ===
+
+if [[ "$USE_PAGES" == "true" ]]; then
+    # Cloudflare Pages mode
+    log "Setting up Cloudflare Pages..."
+    
+    # Check rclone
+    RCLONE="${RCLONE_PATH:-$(command -v rclone 2>/dev/null || echo "$USER_HOME/bin/rclone")}"
+    [[ -x "$RCLONE" ]] || {
+        warn "rclone not found - install from https://rclone.org/install/"
+        warn "Cloud uploads will fail until rclone is installed"
+    }
+    
+    # Check node/npm for wrangler
+    if ! command -v node &>/dev/null; then
+        if [[ $EUID -eq 0 ]]; then
+            log "Installing Node.js..."
+            apt-get install -y -qq nodejs npm > /dev/null 2>&1
+            ok "Node.js installed"
+        else
+            warn "Node.js not found - install for Pages deployment"
+        fi
+    fi
+    
+    # Validate storage config
+    STORAGE_OK=false
+    [[ "${DO_ENABLED:-}" == "true" && -n "${DO_SPACES_KEY:-}" ]] && STORAGE_OK=true
+    [[ "${R2_ENABLED:-}" == "true" && -n "${R2_ACCESS_KEY_ID:-}" ]] && STORAGE_OK=true
+    [[ "$STORAGE_OK" == "true" ]] || warn "No storage configured (DO_ENABLED or R2_ENABLED)"
+    
+    ok "Cloudflare Pages configured"
+    
+elif [[ "$USE_CADDY" == "true" ]]; then
+    # Caddy mode (requires root)
+    [[ $EUID -eq 0 ]] || err "Caddy install requires sudo"
+    
+    # Validate Caddy config
+    [[ "$DEPLOY_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || err "Invalid DEPLOY_IP"
+    [[ -n "$DEPLOY_DOMAIN" && "$DEPLOY_DOMAIN" != *"example"* ]] || err "Set DEPLOY_DOMAIN in config.env"
+    
+    # Install Caddy
+    if ! command -v caddy &>/dev/null; then
+        log "Installing Caddy..."
+        curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg 2>/dev/null
+        curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' > /etc/apt/sources.list.d/caddy-stable.list
+        apt-get update -qq && apt-get install -y -qq caddy > /dev/null 2>&1
+    fi
+    ok "Caddy installed"
+    
+    # Configure Caddy
+    export DEPLOY_IP DEPLOY_DOMAIN DEPLOY_EMAIL DEPLOY_DIR
+    envsubst < "$DEPLOY_DIR/configs/Caddyfile.template" > /etc/caddy/Caddyfile
+    systemctl enable caddy > /dev/null 2>&1
+    systemctl restart caddy
+    systemctl is-active --quiet caddy && ok "Caddy running" || err "Caddy failed"
+    
+    # fail2ban (optional)
+    if systemctl is-active --quiet fail2ban 2>/dev/null; then
+        cp "$DEPLOY_DIR/configs/fail2ban-caddy.filter" /etc/fail2ban/filter.d/caddy.conf 2>/dev/null || true
+        cp "$DEPLOY_DIR/configs/fail2ban-caddy.conf" /etc/fail2ban/jail.d/caddy.local 2>/dev/null || true
+        systemctl restart fail2ban 2>/dev/null || true
+        ok "fail2ban configured"
+    fi
 fi
-if [ ! -d "$CODE_DIR/venv" ]; then
-    sudo -u $ACTUAL_USER python3 -m venv "$CODE_DIR/venv"
-fi
-sudo -u $ACTUAL_USER bash -c "source $CODE_DIR/venv/bin/activate && pip install -q --upgrade pip && pip install -q streamlit dnspython pandas requests urllib3"
-echo -e "${GREEN}✓ Python environment ready${NC}"
 
-# Process templates and install configs
-echo -e "${BLUE}[5/7] Installing configurations...${NC}"
+# === Cron Jobs ===
+log "Setting up cron..."
+export DEPLOY_DIR USER_HOME
+CRON_HOURLY=$(envsubst < "$DEPLOY_DIR/configs/aroivalidator.cron.template" 2>/dev/null || echo "5 * * * * $DEPLOY_DIR/scripts/run-batch-validation.sh >> $DEPLOY_DIR/logs/cron.log 2>&1")
+CRON_MONTHLY=$(envsubst < "$DEPLOY_DIR/configs/monthly-compression.cron.template" 2>/dev/null || echo "0 2 1 * * $DEPLOY_DIR/scripts/compress-old-data.sh >> $DEPLOY_DIR/logs/compression.log 2>&1")
 
-# Process Caddyfile template
-export DEPLOY_IP DEPLOY_DOMAIN DEPLOY_EMAIL DEPLOY_DIR
-envsubst < "$DEPLOY_DIR/configs/Caddyfile.template" > /etc/caddy/Caddyfile
+CURRENT_CRON=$(crontab -l 2>/dev/null || echo "")
+UPDATED=false
 
-# Process cron templates
-CRON_HOURLY=$(envsubst < "$DEPLOY_DIR/configs/aroivalidator.cron.template")
-CRON_MONTHLY=$(envsubst < "$DEPLOY_DIR/configs/monthly-compression.cron.template")
-
-# Install cron jobs (amend, not overwrite)
-CURRENT_CRON=$(sudo -u $ACTUAL_USER crontab -l 2>/dev/null || echo "")
-CRON_CHANGED=false
-
-if ! echo "$CURRENT_CRON" | grep -q "run-batch-validation.sh"; then
+if ! echo "$CURRENT_CRON" | grep -q "run-batch-validation"; then
     CURRENT_CRON="$CURRENT_CRON"$'\n'"$CRON_HOURLY"
-    CRON_CHANGED=true
-    echo -e "${GREEN}  + Added hourly validation cron${NC}"
-else
-    echo -e "${GREEN}  ✓ Hourly validation cron already exists${NC}"
+    UPDATED=true
 fi
-
-if ! echo "$CURRENT_CRON" | grep -q "compress-old-data.sh"; then
+if ! echo "$CURRENT_CRON" | grep -q "compress-old-data"; then
     CURRENT_CRON="$CURRENT_CRON"$'\n'"$CRON_MONTHLY"
-    CRON_CHANGED=true
-    echo -e "${GREEN}  + Added monthly compression cron${NC}"
-else
-    echo -e "${GREEN}  ✓ Monthly compression cron already exists${NC}"
+    UPDATED=true
 fi
 
-if [ "$CRON_CHANGED" = true ]; then
-    echo "$CURRENT_CRON" | grep -v '^$' | sudo -u $ACTUAL_USER crontab -
-fi
-echo -e "${GREEN}✓ Cron jobs configured${NC}"
+[[ "$UPDATED" == "true" ]] && echo "$CURRENT_CRON" | grep -v '^$' | crontab -
+ok "Cron jobs"
 
-# Set permissions
-chown -R $ACTUAL_USER:$ACTUAL_USER "$DEPLOY_DIR" "$CODE_DIR"
-chmod 755 "$DEPLOY_DIR"/scripts/*.sh
-chmod 600 "$DEPLOY_DIR/config.env"
-chmod 711 "$USER_HOME"
-chmod 755 "$DEPLOY_DIR/public"
+# === Permissions ===
+chmod 755 "$DEPLOY_DIR"/scripts/*.sh 2>/dev/null || true
+chmod 600 "$DEPLOY_DIR/config.env" 2>/dev/null || true
+chmod 755 "$DEPLOY_DIR/public" 2>/dev/null || true
+ok "Permissions"
 
-# Start Caddy
-echo -e "${BLUE}[6/7] Starting Caddy...${NC}"
-systemctl enable caddy > /dev/null 2>&1
-systemctl restart caddy
-
-if systemctl is-active --quiet caddy; then
-    echo -e "${GREEN}✓ Caddy running on $DEPLOY_IP${NC}"
-else
-    echo -e "${RED}✗ Caddy failed - check: journalctl -u caddy${NC}"
-    exit 1
-fi
-
-# Configure fail2ban
-echo -e "${BLUE}[7/7] Configuring fail2ban...${NC}"
-if systemctl is-active --quiet fail2ban; then
-    cp "$DEPLOY_DIR/configs/fail2ban-caddy.filter" /etc/fail2ban/filter.d/caddy.conf
-    cp "$DEPLOY_DIR/configs/fail2ban-caddy.conf" /etc/fail2ban/jail.d/caddy.local
-    systemctl restart fail2ban
-    echo -e "${GREEN}✓ fail2ban configured${NC}"
-else
-    echo -e "${GREEN}⚠ fail2ban not running (optional)${NC}"
-fi
-
+# === Summary ===
 echo ""
-echo -e "${GREEN}╔════════════════════════════════════════════════════════════╗${NC}"
-echo -e "${GREEN}║              ✓ Installation Complete!                     ║${NC}"
-echo -e "${GREEN}╚════════════════════════════════════════════════════════════╝${NC}"
-echo ""
-echo "Next validation: $(date -d 'next hour' +'%H'):05"
-echo "Website: https://$DEPLOY_DOMAIN"
-echo "Monitor: tail -f $DEPLOY_DIR/logs/cron.log"
+echo -e "${GREEN}╔═══════════════════════════════════════════════════════════════╗${NC}"
+echo -e "${GREEN}║                    ✓ Installation Complete                    ║${NC}"
+echo -e "${GREEN}╚═══════════════════════════════════════════════════════════════╝${NC}"
 echo ""
 
+if [[ "$USE_PAGES" == "true" ]]; then
+    echo "Mode:     Cloudflare Pages + Cloud Storage"
+    echo "Deploy:   $DEPLOY_DIR/scripts/pages-deploy.sh"
+    echo "Upload:   Automatic at :05 each hour"
+    [[ -n "${PAGES_PROJECT_NAME:-}" ]] && echo "Site:     https://${PAGES_PROJECT_NAME}.pages.dev"
+else
+    echo "Mode:     Caddy (self-hosted)"
+    echo "Site:     https://$DEPLOY_DOMAIN"
+fi
+echo ""
+echo "Validate: $DEPLOY_DIR/scripts/run-batch-validation.sh"
+echo "Logs:     tail -f $DEPLOY_DIR/logs/cron.log"
+echo "Next run: $(date -d 'next hour' +'%H'):05"
+echo ""

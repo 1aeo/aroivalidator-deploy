@@ -1,6 +1,11 @@
 # Environment config (contains personal settings)
 config.env
 
+# Cloudflare (generated files)
+wrangler.toml
+.wrangler/
+pages-static/
+
 # Data files
 logs/
 public/*.json
@@ -15,3 +20,4 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+backups/

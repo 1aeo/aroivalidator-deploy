@@ -1,87 +1,89 @@
-# AROI Validator - Deployment Template
+# AROI Validator - Deployment
 
-Automated Tor relay validation with web interface. Validates ~11,000 relays hourly.
+Validates ~11,000 Tor relay operator IDs hourly.
 
-**Live example:** https://aroivalidator.1aeo.com  
-**Code repo:** https://github.com/1aeo/AROIValidator
+**Live:** https://aroivalidator.pages.dev  
+**Code:** https://github.com/1aeo/AROIValidator
 
 ---
 
 ## Quick Start
 
 ```bash
-# 1. Clone code repo
+# Clone repos
 git clone https://github.com/1aeo/AROIValidator.git ~/aroivalidator
-
-# 2. Clone deployment
 git clone <this-repo> ~/aroivalidator-deploy
 cd ~/aroivalidator-deploy
 
-# 3. Configure
+# Configure
 cp config.env.example config.env
-nano config.env  # Edit 3 values (see below)
+nano config.env
 
-# 4. Install
-sudo ./scripts/install.sh
-
-# Done! Visit https://your-domain.com
+# Install
+./scripts/install.sh
 ```
 
 ---
 
-## Configuration (config.env)
+## Hosting Options
 
-Edit these 3 values:
+### Option 1: Cloudflare Pages (Default)
 
+Static frontend on Pages, JSON data on DO Spaces/R2.
+
+**Required in config.env:**
 ```bash
-DEPLOY_IP=1.2.3.4                        # Your server IP
-DEPLOY_DOMAIN=validator.example.com      # Your domain
-DEPLOY_EMAIL=admin@example.com           # Let's Encrypt email
+CLOUDFLARE_ACCOUNT_ID=xxx
+CLOUDFLARE_API_TOKEN=xxx
+DO_SPACES_KEY=xxx          # Primary storage
+DO_SPACES_SECRET=xxx
+R2_ACCESS_KEY_ID=xxx       # Backup storage
+R2_SECRET_ACCESS_KEY=xxx
 ```
 
-Optional:
+**Deploy:**
 ```bash
-CLOUDFLARE_MODE=flexible  # or 'full-strict'
+./scripts/pages-deploy.sh
 ```
 
-**Cloudflare DNS:** Add A record: `your-subdomain` → `your-ip` (gray cloud initially)
+### Option 2: Caddy (Self-hosted Fallback)
+
+```bash
+# config.env
+DEPLOY_IP=1.2.3.4
+DEPLOY_DOMAIN=validator.example.com
+DEPLOY_EMAIL=admin@example.com
+
+# Install
+sudo ./scripts/install.sh --caddy
+```
 
 ---
 
-## What It Does
+## Automation
 
-**Hourly (at :05):**
-- Validates ~11,000 Tor relay operator IDs (AROIs)
-- Publishes JSON results to website
-- Auto-updates code from GitHub
-
-**Monthly (1st at 2 AM):**
-- Compresses files 180+ days old (saves 90% space)
-- Rotates logs when > 50 MB
-
-**Website:**
-- Green theme (1aeo.com style)
-- View/Download buttons for all results
-- Pagination for 1000s of files
-- Historical archive with monthly compression
+| Schedule | Task |
+|----------|------|
+| Hourly :05 | Validate relays, upload to cloud |
+| Monthly 1st | Compress data >180 days old |
 
 ---
 
 ## Commands
 
 ```bash
+# Manual validation
+./scripts/run-batch-validation.sh
+
+# Upload to cloud
+./scripts/upload-do.sh
+./scripts/upload-r2.sh
+
+# Deploy frontend
+./scripts/pages-deploy.sh
+
 # View logs
-tail -f ~/aroivalidator-deploy/logs/cron.log
-
-# Run validation manually  
-~/aroivalidator-deploy/scripts/run-batch-validation.sh
-
-# Update code
-cd ~/aroivalidator && git pull
-
-# Check status
-sudo systemctl status caddy
-crontab -l
+tail -f logs/cron.log
 ```
 
 ---
@@ -89,68 +91,26 @@ crontab -l
 ## Structure
 
 ```
-aroivalidator/         Code (git repo)
-aroivalidator-deploy/  Deployment (this template)
-├── config.env         Your settings (gitignored)
-├── configs/           Caddyfile, cron templates
-├── scripts/           Automation scripts
-├── public/            Web files + JSON results
-└── logs/              cron.log
+~/aroivalidator/           # Code (validator)
+~/aroivalidator-deploy/    # This repo
+├── config.env             # Your settings (gitignored)
+├── scripts/               # Automation
+├── functions/             # Pages Function (data proxy)
+├── public/                # Local JSON results
+└── logs/                  # cron.log
 ```
 
 ---
 
-## Features
+## Cache
 
-✅ Auto-detection (username, paths)  
-✅ Cloudflare integration (Flexible or Full Strict SSL)  
-✅ fail2ban rate limiting  
-✅ Monthly data compression (180 day retention)  
-✅ Security headers  
-✅ 10 parallel workers  
-
----
-
-## Troubleshooting
-
-**Website not working?**
-```bash
-sudo systemctl status caddy
-curl -I http://YOUR_IP -H "Host: your-domain.com"
-```
-
-**Validation not running?**
-```bash
-crontab -l | grep aroi
-tail ~/aroivalidator-deploy/logs/cron.log
-```
-
-**Permission errors?**
-```bash
-chmod 711 $HOME
-chmod 755 ~/aroivalidator-deploy/public
-```
-
----
-
-## Requirements
-
-- Debian/Ubuntu Linux
-- Python 3.11+
-- Cloudflare account
-- DNS configured
-
----
-
-## Credits
-
-- **AROI Framework:** https://nusenu.github.io/tor-relay-operator-ids-trust-information/
-- **1AEO:** https://1aeo.com
-- **Tor Project:** https://www.torproject.org
+| File | TTL |
+|------|-----|
+| `latest.json` | 60s |
+| `aroi_validation_*.json` | 1 year (immutable) |
 
 ---
 
 ## License
 
 Apache 2.0
-

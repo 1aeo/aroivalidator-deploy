@@ -1,92 +1,74 @@
 #!/bin/bash
-# AROI Validator Hourly Batch Execution Script
-# Automatically pulls latest code and runs validation
-
+# AROI Validator Hourly Batch - Validation + Cloud Upload
+# Uploads to DO Spaces (primary) and R2 (backup) in parallel
 set -euo pipefail
 
-# Auto-detect paths
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEPLOY_DIR="$(dirname "$SCRIPT_DIR")"
 CODE_DIR="$HOME/aroivalidator"
-VENV_DIR="$CODE_DIR/venv"
 LOG_DIR="$DEPLOY_DIR/logs"
 WEB_DIR="$DEPLOY_DIR/public"
 LOCK_FILE="$LOG_DIR/validation.lock"
 
-# Create directories if they don't exist
+[[ -f "$DEPLOY_DIR/config.env" ]] && source "$DEPLOY_DIR/config.env"
+: "${CLOUD_UPLOAD:=true}" "${DO_ENABLED:=false}" "${R2_ENABLED:=false}"
+
 mkdir -p "$LOG_DIR" "$WEB_DIR"
 
-# Prevent concurrent execution
-if [ -f "$LOCK_FILE" ]; then
-    LOCK_PID=$(cat "$LOCK_FILE" 2>/dev/null)
-    if [ -n "$LOCK_PID" ] && kill -0 "$LOCK_PID" 2>/dev/null; then
-        echo "Another validation is already running (PID: $LOCK_PID). Exiting."
-        exit 0
-    fi
+# Lock to prevent concurrent runs
+if [[ -f "$LOCK_FILE" ]]; then
+    PID=$(cat "$LOCK_FILE" 2>/dev/null)
+    [[ -n "$PID" ]] && kill -0 "$PID" 2>/dev/null && { echo "Already running (PID $PID)"; exit 0; }
     rm -f "$LOCK_FILE"
 fi
 echo $$ > "$LOCK_FILE"
 trap 'rm -f "$LOCK_FILE"' EXIT
 
-echo "========================================="
-echo "AROI Validator Batch Run - $(date)"
-echo "========================================="
+echo "=== AROI Batch $(date) ==="
 
-cd "$CODE_DIR" || exit 1
+cd "$CODE_DIR"
+[[ -d ".git" ]] || { echo "Not a git repo"; exit 1; }
 
-# Verify we're in a git repository
-if [ ! -d ".git" ]; then
-    echo "Error: Not a git repository"
-    exit 1
-fi
+# Update and run
+git fetch origin main 2>/dev/null && git reset --hard origin/main 2>/dev/null || true
+source "$CODE_DIR/venv/bin/activate"
 
-# Update code from git
-echo "Pulling latest code from git..."
-git fetch origin main 2>/dev/null || echo "Warning: Git fetch failed"
-git reset --hard origin/main 2>/dev/null || echo "Warning: Git reset failed, using existing code"
+echo "Running validation..."
+BATCH_LIMIT=0 PARALLEL=true MAX_WORKERS=10 python3 aroi_cli.py batch || { echo "Validation failed"; exit 1; }
 
-# Verify virtual environment exists
-if [ ! -f "$VENV_DIR/bin/activate" ]; then
-    echo "Error: Virtual environment not found"
-    exit 1
-fi
-
-source "$VENV_DIR/bin/activate"
-
-# Run batch validation
-echo "Starting batch validation..."
-BATCH_LIMIT=0 PARALLEL=true MAX_WORKERS=10 python3 aroi_cli.py batch || {
-    echo "Error: Validation failed"
-    exit 1
-}
-
-SOURCE_RESULTS="$CODE_DIR/validation_results"
-
-if [ -d "$SOURCE_RESULTS" ]; then
-    echo "Publishing results to web directory..."
+# Publish results
+SRC="$CODE_DIR/validation_results"
+if [[ -d "$SRC" ]]; then
+    echo "Publishing..."
+    rsync -a --include='*.json' --exclude='*' "$SRC/" "$WEB_DIR/" 2>/dev/null || \
+        find "$SRC" -maxdepth 1 -name "*.json" -newer "$WEB_DIR/files.json" -exec cp {} "$WEB_DIR/" \; 2>/dev/null
     
-    # rsync -a copies only changed files AND sets permissions (no separate chmod needed)
-    rsync -a --include='*.json' --exclude='*' "$SOURCE_RESULTS/" "$WEB_DIR/" 2>/dev/null || {
-        find "$SOURCE_RESULTS" -maxdepth 1 -name "*.json" -type f -newer "$WEB_DIR/files.json" -exec cp -f {} "$WEB_DIR/" \; 2>/dev/null || true
+    LATEST=$(ls -t "$SRC"/aroi_validation_*.json 2>/dev/null | head -1)
+    [[ -n "$LATEST" ]] && cp -f "$LATEST" "$WEB_DIR/latest.json" && echo "Latest: $(basename "$LATEST")"
+    
+    # File manifest
+    find "$WEB_DIR" -maxdepth 1 -name "aroi_validation_*.json" -printf '%f\n' 2>/dev/null \
+        | sort -r | jq -Rs 'split("\n") | map(select(length > 0))' > "$WEB_DIR/files.json"
+fi
+
+# Cloud upload (parallel)
+if [[ "$CLOUD_UPLOAD" == "true" ]]; then
+    echo "=== Cloud Upload ==="
+    PIDS=()
+    
+    [[ "$DO_ENABLED" == "true" ]] && {
+        "$SCRIPT_DIR/upload-do.sh" "$WEB_DIR" >> "$LOG_DIR/upload-do.log" 2>&1 && echo "✓ DO" || echo "✗ DO" &
+        PIDS+=($!)
+    }
+    [[ "$R2_ENABLED" == "true" ]] && {
+        "$SCRIPT_DIR/upload-r2.sh" "$WEB_DIR" >> "$LOG_DIR/upload-r2.log" 2>&1 && echo "✓ R2" || echo "✗ R2" &
+        PIDS+=($!)
     }
     
-    # Get newest file using ls -t (optimized for time-sorting, faster than find|sort)
-    # Subshell disables pipefail to avoid SIGPIPE from head closing the pipe early
-    LATEST_RESULT=$(set +o pipefail; ls -t "$SOURCE_RESULTS"/aroi_validation_*.json 2>/dev/null | head -1)
-    
-    if [ -n "$LATEST_RESULT" ] && [ -f "$LATEST_RESULT" ]; then
-        cp -f "$LATEST_RESULT" "$WEB_DIR/latest.json"
-        echo "Latest result published: $(basename "$LATEST_RESULT")"
-    fi
-    
-    # Create files.json manifest (single find operation for the web directory)
-    echo "Creating file manifest..."
-    find "$WEB_DIR" -maxdepth 1 -name "aroi_validation_*.json" -printf '%f\n' 2>/dev/null \
-        | sort -r \
-        | jq -R -s 'split("\n") | map(select(length > 0))' \
-        > "$WEB_DIR/files.json.tmp" \
-        && mv "$WEB_DIR/files.json.tmp" "$WEB_DIR/files.json" \
-        || echo '[]' > "$WEB_DIR/files.json"
+    # Wait for uploads
+    FAILED=0
+    for pid in "${PIDS[@]:-}"; do wait "$pid" || ((FAILED++)); done
+    [[ $FAILED -gt 0 ]] && echo "⚠ $FAILED upload(s) failed" || echo "✓ All uploads done"
 fi
 
-echo "Batch validation completed at $(date)"
+echo "=== Complete $(date) ==="
