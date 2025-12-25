@@ -6,6 +6,21 @@
     <meta name="description" content="AROI Validator - Automated validation of Authenticated Relay Operator IDs">
     <title>AROI Validator - Tor Relay Verification Results</title>
     <style>
+        /* 1AEO Brand Design Tokens */
+        :root {
+            --aeo-green: #00ff7f;
+            --aeo-green-dim: #00cc66;
+            --aeo-green-hover: #009955;
+            --aeo-green-dark: #004d26;
+            --aeo-dark-bg: #121212;
+            --aeo-dark-surface: #1e1e1e;
+            --aeo-dark-border: rgba(0, 255, 127, 0.2);
+            --aeo-text: #ffffff;
+            --aeo-text-muted: #cccccc;
+            --aeo-text-dim: #888888;
+            --aeo-dark-hover: #252525;
+        }
+
         * {
             margin: 0;
             padding: 0;
@@ -14,8 +29,8 @@
 
         body {
             font-family: Arial, sans-serif;
-            background-color: #121212;
-            color: #ffffff;
+            background-color: var(--aeo-dark-bg);
+            color: var(--aeo-text);
             line-height: 1.6;
             min-height: 100vh;
             margin: 0;
@@ -31,19 +46,19 @@
         header {
             text-align: center;
             padding: 3rem 0;
-            border-bottom: 2px solid #00ff7f;
+            border-bottom: 2px solid var(--aeo-green);
             margin-bottom: 3rem;
         }
 
         h1 {
             font-size: 2.5rem;
             margin-bottom: 0.5rem;
-            color: #00ff7f;
+            color: var(--aeo-green);
             font-weight: bold;
         }
 
         .subtitle {
-            color: #00ff7f;
+            color: var(--aeo-green);
             font-size: 1.1rem;
             margin-bottom: 1rem;
         }
@@ -51,7 +66,7 @@
         .description {
             max-width: 800px;
             margin: 0 auto;
-            color: #cccccc;
+            color: var(--aeo-text-muted);
             font-size: 18px;
             line-height: 1.6;
         }
@@ -64,8 +79,8 @@
         }
 
         .stat-card {
-            background: #1e1e1e;
-            border: 1px solid #00ff7f;
+            background: var(--aeo-dark-surface);
+            border: 1px solid var(--aeo-green);
             border-radius: 10px;
             padding: 1.5rem;
             transition: transform 0.2s, box-shadow 0.2s;
@@ -78,7 +93,7 @@
         }
 
         .stat-label {
-            color: #00ff7f;
+            color: var(--aeo-green);
             font-size: 0.9rem;
             text-transform: uppercase;
             letter-spacing: 1px;
@@ -86,14 +101,14 @@
         }
 
         .stat-value {
-            color: #fff;
+            color: var(--aeo-text);
             font-size: 2rem;
             font-weight: bold;
         }
 
         .section {
-            background: #1e1e1e;
-            border: 1px dashed #00ff7f;
+            background: var(--aeo-dark-surface);
+            border: 1px dashed var(--aeo-green);
             border-radius: 10px;
             padding: 2rem;
             margin: 2rem 0;
@@ -101,7 +116,7 @@
         }
 
         h2 {
-            color: #00ff7f;
+            color: var(--aeo-green);
             margin-bottom: 1rem;
             font-size: 1.8rem;
             font-weight: bold;
@@ -113,8 +128,8 @@
         }
 
         .file-item {
-            background: #1e1e1e;
-            border: 1px solid #00ff7f;
+            background: var(--aeo-dark-surface);
+            border: 1px solid var(--aeo-green);
             border-radius: 8px;
             padding: 1rem;
             margin: 0.5rem 0;
@@ -125,22 +140,22 @@
         }
 
         .file-item:hover {
-            background: #252525;
+            background: var(--aeo-dark-hover);
             box-shadow: 0 0 10px rgba(0, 255, 127, 0.4);
         }
 
         .file-name {
-            color: #ffffff;
+            color: var(--aeo-text);
             font-weight: 500;
         }
 
         .file-meta {
-            color: #cccccc;
+            color: var(--aeo-text-muted);
             font-size: 0.9rem;
         }
 
         a {
-            color: #00ff7f;
+            color: var(--aeo-green);
             text-decoration: none;
             transition: color 0.2s;
         }
@@ -151,8 +166,8 @@
 
         .button {
             display: inline-block;
-            background-color: #00ff7f;
-            color: #121212;
+            background-color: var(--aeo-green);
+            color: var(--aeo-dark-bg);
             padding: 0.75rem 1.5rem;
             border-radius: 5px;
             text-decoration: none;
@@ -163,13 +178,13 @@
         }
 
         .button:hover {
-            background-color: #00cc66;
+            background-color: var(--aeo-green-dim);
             transform: translateY(-2px);
         }
 
         .info-box {
             background: rgba(0, 255, 127, 0.1);
-            border-left: 4px solid #00ff7f;
+            border-left: 4px solid var(--aeo-green);
             padding: 1rem;
             border-radius: 4px;
             margin: 1rem 0;
@@ -177,31 +192,17 @@
 
         .loading {
             text-align: center;
-            color: #cccccc;
+            color: var(--aeo-text-muted);
             padding: 2rem;
         }
         
         p {
             font-size: 18px;
-            color: #cccccc;
-        }
-
-        footer {
-            text-align: center;
-            padding: 2rem 0;
-            margin-top: 3rem;
-            border-top: 1px solid #00ff7f;
-            color: #777777;
-            font-size: 14px;
-        }
-
-        .footer-link {
-            color: #00ff7f;
-            margin: 0 0.5rem;
+            color: var(--aeo-text-muted);
         }
 
         .update-time {
-            color: #cccccc;
+            color: var(--aeo-text-muted);
             font-size: 0.9rem;
             margin-top: 0.5rem;
         }
@@ -219,9 +220,129 @@
                 padding: 1rem;
             }
         }
+
+        /* 1AEO Cross-Site Navigation Bar */
+        .aeo-cross-nav {
+            background-color: var(--aeo-dark-surface);
+            padding: 10px 0;
+            border-bottom: 1px solid var(--aeo-dark-border);
+            margin-bottom: 0;
+        }
+        
+        .aeo-cross-nav .aeo-nav-container {
+            max-width: 95%;
+            margin: 0 auto;
+            padding: 0 15px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+        
+        .aeo-cross-nav .aeo-nav-brand {
+            color: var(--aeo-green);
+            text-decoration: none;
+            font-weight: bold;
+            font-size: 16px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .aeo-cross-nav .aeo-nav-brand:hover {
+            color: var(--aeo-green);
+            text-decoration: none;
+        }
+        
+        .aeo-cross-nav .aeo-nav-links {
+            display: flex;
+            gap: 20px;
+            flex-wrap: wrap;
+            font-size: 14px;
+        }
+        
+        .aeo-cross-nav .aeo-nav-links a {
+            color: var(--aeo-text-muted);
+            text-decoration: none;
+            transition: color 0.2s ease;
+        }
+        
+        .aeo-cross-nav .aeo-nav-links a:hover {
+            color: var(--aeo-green);
+            text-decoration: none;
+        }
+        
+        .aeo-cross-nav .aeo-nav-links a.active {
+            color: var(--aeo-green);
+            font-weight: 500;
+        }
+        
+        @media (max-width: 480px) {
+            .aeo-cross-nav .aeo-nav-container {
+                justify-content: center;
+                text-align: center;
+            }
+            .aeo-cross-nav .aeo-nav-links {
+                justify-content: center;
+                gap: 12px;
+            }
+        }
+
+        /* 1AEO Footer */
+        .aeo-footer {
+            background-color: var(--aeo-dark-surface);
+            color: var(--aeo-text-muted);
+            padding: 25px 20px;
+            margin-top: 40px;
+            text-align: center;
+            border-top: 1px solid var(--aeo-dark-border);
+        }
+        
+        .aeo-footer a {
+            color: var(--aeo-green);
+            text-decoration: none;
+        }
+        
+        .aeo-footer a:hover {
+            color: var(--aeo-green);
+            text-decoration: underline;
+        }
+        
+        .aeo-footer-links {
+            display: flex;
+            justify-content: center;
+            gap: 25px;
+            margin-bottom: 15px;
+            flex-wrap: wrap;
+        }
+        
+        .aeo-footer-brand {
+            font-size: 14px;
+            margin: 0;
+        }
+        
+        .aeo-footer-legal {
+            font-size: 12px;
+            color: var(--aeo-text-dim);
+            margin-top: 10px;
+        }
     </style>
 </head>
 <body>
+    <nav class="aeo-cross-nav">
+        <div class="aeo-nav-container">
+            <a href="https://www.1aeo.com" class="aeo-nav-brand">
+                <span>1AEO</span>
+            </a>
+            <div class="aeo-nav-links">
+                <a href="https://www.1aeo.com">Home</a>
+                <a href="https://metrics.1aeo.com">Metrics</a>
+                <a href="https://aroivalidator.1aeo.com" class="active">AROI Validator</a>
+                <a href="https://routefluxmap.1aeo.com">RouteFluxMap</a>
+            </div>
+        </div>
+    </nav>
     <div class="container">
         <header>
             <h1>🛡️ AROI Validator</h1>
@@ -259,14 +380,14 @@
                 <a href="latest.json" class="button" download>⬇️ Download JSON</a>
             </p>
             
-            <p style="color: #7986cb; font-size: 0.85rem; margin-top: 1.5rem; text-align: center;" id="validation-timestamp">
+            <p style="color: var(--aeo-text-dim); font-size: 0.85rem; margin-top: 1.5rem; text-align: center;" id="validation-timestamp">
                 Loading timestamp...
             </p>
         </div>
 
         <div class="section">
             <h2>📁 Historical Results Archive</h2>
-            <p style="color: #cccccc; margin-bottom: 1rem;">
+            <p style="color: var(--aeo-text-muted); margin-bottom: 1rem;">
                 Browse all validation results. Each file contains complete metadata, statistics, 
                 and detailed validation results for individual relays.
             </p>
@@ -277,45 +398,42 @@
 
         <div class="section">
             <h2>ℹ️ About AROI Validation</h2>
-            <p style="color: #cccccc;">
+            <p style="color: var(--aeo-text-muted);">
                 Authenticated Relay Operator IDs (AROIs) enable Tor relay operators to cryptographically 
                 prove ownership of their contact information. This validator automatically checks these 
                 proofs to verify relay operator authenticity and build trust in the Tor network.
             </p>
-            <p style="color: #cccccc; margin-top: 1rem;">
+            <p style="color: var(--aeo-text-muted); margin-top: 1rem;">
                 <strong>Validation Methods:</strong>
             </p>
-            <ul style="color: #cccccc; margin-left: 2rem; margin-top: 0.5rem;">
+            <ul style="color: var(--aeo-text-muted); margin-left: 2rem; margin-top: 0.5rem;">
                 <li><strong>dns-rsa:</strong> DNSSEC-signed TXT record verification</li>
                 <li><strong>uri-rsa:</strong> URI-based RSA signature validation</li>
             </ul>
-            <p style="color: #cccccc; margin-top: 1rem; font-size: 0.9rem;">
+            <p style="color: var(--aeo-text-muted); margin-top: 1rem; font-size: 0.9rem;">
                 Learn more about the 
                 <a href="https://nusenu.github.io/tor-relay-operator-ids-trust-information/" target="_blank">
                     AROI framework and trust methodology
                 </a>
             </p>
         </div>
-
-        <footer>
-            <p>
-                <a href="https://github.com/1aeo/AROIValidator" class="footer-link" target="_blank">
-                    GitHub Repository
-                </a>
-                |
-                <a href="https://nusenu.github.io/tor-relay-operator-ids-trust-information/" class="footer-link" target="_blank">
-                    AROI Methodology
-                </a>
-                |
-                <a href="https://1aeo.com" class="footer-link" target="_blank">
-                    1st Amendment Encrypted Openness
-                </a>
-            </p>
-            <p style="margin-top: 0.5rem; font-size: 0.85rem;">
-                Automated validation runs hourly. Data sourced from Tor Onionoo API.
-            </p>
-        </footer>
     </div>
+
+    <footer class="aeo-footer">
+        <div class="aeo-footer-links">
+            <a href="https://metrics.1aeo.com">Metrics</a>
+            <a href="https://aroivalidator.1aeo.com">AROI Validator</a>
+            <a href="https://routefluxmap.1aeo.com">RouteFluxMap</a>
+            <a href="https://github.com/1aeo">GitHub</a>
+        </div>
+        <p class="aeo-footer-brand">
+            Part of <a href="https://www.1aeo.com" style="font-weight: bold;">1st Amendment Encrypted Openness LLC</a>
+        </p>
+        <p class="aeo-footer-legal">
+            Automated validation runs hourly. Data sourced from <a href="https://onionoo.torproject.org/">Tor Project Onionoo</a>. 
+            Learn about the <a href="https://nusenu.github.io/tor-relay-operator-ids-trust-information/">AROI methodology</a>.
+        </p>
+    </footer>
 
     <script>
         // Load and display latest results
@@ -462,14 +580,14 @@
             // Add pagination controls if needed
             if (totalPages > 1) {
                 html += `
-                    <li class="file-item" style="margin-top: 1rem; border: 1px solid #00ff7f; justify-content: center;">
+                    <li class="file-item" style="margin-top: 1rem; border: 1px solid var(--aeo-green); justify-content: center;">
                         <div style="display: flex; gap: 1rem; align-items: center;">
                             <button class="button" ${page === 0 ? 'disabled' : ''} 
                                     onclick="displayPage(${page - 1})" 
                                     style="padding: 0.5rem 1rem; font-size: 0.9rem; ${page === 0 ? 'opacity: 0.5; cursor: not-allowed;' : ''}">
                                 ← Previous
                             </button>
-                            <span style="color: #00ff7f;">
+                            <span style="color: var(--aeo-green);">
                                 Page ${page + 1} of ${totalPages} (${allFiles.length} total results)
                             </span>
                             <button class="button" ${page === totalPages - 1 ? 'disabled' : ''} 
