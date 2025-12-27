@@ -10,8 +10,14 @@ set -euo pipefail
 
 # === Path Detection (call init_paths from sourcing script) ===
 init_paths() {
-    # Use BASH_SOURCE[1] to get the calling script's directory
+    # Use BASH_SOURCE to get the calling script's directory
+    # Default to index 1 (direct caller), but allow override for nested sourcing
     local caller_idx=${1:-1}
+    local max_idx=$((${#BASH_SOURCE[@]} - 1))
+    # Clamp to valid range
+    [[ $caller_idx -gt $max_idx ]] && caller_idx=$max_idx
+    [[ $caller_idx -lt 0 ]] && caller_idx=0
+    
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[$caller_idx]}")" && pwd)"
     DEPLOY_DIR="$(dirname "$SCRIPT_DIR")"
     export SCRIPT_DIR DEPLOY_DIR

@@ -10,8 +10,8 @@ const TTL = { latest: 60, historical: 31536000, default: 300 };
 // Security: Pattern to detect traversal attempts (encoded or raw)
 const UNSAFE_PATH = /(?:^|\/)\.\.(?:\/|$)|%2e|%00|\x00/i;
 
-// Valid proxy paths pattern
-const PROXY_PATH = /^(?:archives\/.*\.tar\.gz|.*\.json)$/;
+// Valid proxy paths pattern - strictly validate filenames
+const PROXY_PATH = /^(?:archives\/aroi-\d{6}\.tar\.gz|(?:aroi_validation_\d{8}_\d{6}|latest|files)\.json)$/;
 
 const getPath = (params) => {
   const p = Array.isArray(params.path) ? params.path.join('/') : (params.path || '');
@@ -23,7 +23,8 @@ const getPath = (params) => {
 
 const shouldProxy = (path) => path && PROXY_PATH.test(path);
 
-const isImmutable = (path) => path[0] === 'a';  // 'aroi_validation_*' or 'archives/*'
+// Immutable files: timestamped validation files and archives (but not latest.json/files.json)
+const isImmutable = (path) => /^(?:aroi_validation_|archives\/)/.test(path);
 
 const getCacheTTL = (path, env) => {
   if (path === 'latest.json' || path === 'files.json') 

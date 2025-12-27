@@ -48,9 +48,9 @@ check_rclone() {
 # Remote setup (creates if not exists)
 ensure_remote() {
     local name=$1 provider=$2; shift 2
-    $RCLONE listremotes 2>/dev/null | grep -q "^${name}:$" && return 0
+    "$RCLONE" listremotes 2>/dev/null | grep -q "^${name}:$" && return 0
     log "Creating remote '$name'..."
-    $RCLONE config create "$name" s3 provider="$provider" "$@" --non-interactive >/dev/null
+    "$RCLONE" config create "$name" s3 provider="$provider" "$@" --non-interactive >/dev/null
     log_success "Remote '$name' configured"
 }
 
@@ -113,7 +113,7 @@ list_backups() {
     local remote_marker="$LOG_DIR/last-${storage_lower}-backup-date"
     
     echo "📦 Local: $(ls -1dt "$BACKUP_DIR"/backup-* 2>/dev/null | head -3 | tr '\n' ' ' || echo none)"
-    echo "📦 ${storage}: $($RCLONE lsf "$bucket/_backups/" --dirs-only 2>/dev/null | sort -r | head -3 | tr '\n' ' ' || echo none)"
+    echo "📦 ${storage}: $("$RCLONE" lsf "$bucket/_backups/" --dirs-only 2>/dev/null | sort -r | head -3 | tr '\n' ' ' || echo none)"
     echo "📅 Last local: $(cat "$local_marker" 2>/dev/null || echo never)"
     echo "📅 Last ${storage}: $(cat "$remote_marker" 2>/dev/null || echo never)"
 }
