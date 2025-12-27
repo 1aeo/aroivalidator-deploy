@@ -525,118 +525,69 @@
             }
         }
 
-        // Security: Escape HTML to prevent XSS
+        // Security: Validate filename format and escape for HTML
+        const VALID_FILE = /^aroi_validation_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})\.json$/;
+        const VALID_ARCHIVE = /^archives\/aroi-\d{6}\.tar\.gz$/;
+        
         function escapeHtml(text) {
-            const div = document.createElement('div');
-            div.textContent = text;
-            return div.innerHTML;
-        }
-
-        // Security: Validate filename format to prevent injection
-        function isValidFilename(filename) {
-            // Only allow expected filename patterns
-            return /^aroi_validation_\d{8}_\d{6}\.json$/.test(filename) ||
-                   /^archives\/aroi-\d{6}\.tar\.gz$/.test(filename);
+            return text.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
         }
 
         // Display a specific page of results
         function displayPage(page) {
             const fileList = document.getElementById('file-list');
-            const start = page * filesPerPage;
-            const end = start + filesPerPage;
-            const pageFiles = allFiles.slice(start, end);
             const totalPages = Math.ceil(allFiles.length / filesPerPage);
-            
+            page = Math.max(0, Math.min(page | 0, totalPages - 1));  // Clamp to valid range
             currentPage = page;
             
+            const pageFiles = allFiles.slice(page * filesPerPage, (page + 1) * filesPerPage);
+            
             // Display files
-            let html = pageFiles.map(filename => {
-                // Security: Validate filename before processing
-                if (!isValidFilename(filename)) {
+            const html = pageFiles.map(filename => {
+                // Security: Validate and parse filename
+                const match = VALID_FILE.exec(filename);
+                if (!match && !VALID_ARCHIVE.test(filename)) {
                     console.warn('Invalid filename rejected:', filename);
                     return '';
                 }
                 
-                // Extract date from filename: aroi_validation_YYYYMMDD_HHMMSS.json
-                const match = filename.match(/(\d{8})_(\d{6})/);
                 let displayDate = escapeHtml(filename);
-                
                 if (match) {
-                    const dateStr = match[1];
-                    const timeStr = match[2];
-                    
-                    // Parse into Date object
-                    const year = dateStr.slice(0,4);
-                    const month = dateStr.slice(4,6);
-                    const day = dateStr.slice(6,8);
-                    const hour = timeStr.slice(0,2);
-                    const min = timeStr.slice(2,4);
-                    const sec = timeStr.slice(4,6);
-                    
-                    // Create Date object (assumes UTC/server timezone)
-                    const dateObj = new Date(`${year}-${month}-${day}T${hour}:${min}:${sec}`);
-                    
-                    // Format with AM/PM and timezone
-                    const datePart = `${year}-${month}-${day}`;
+                    const [, y, mo, d, h, mi, s] = match;
+                    const dateObj = new Date(`${y}-${mo}-${d}T${h}:${mi}:${s}`);
                     const timePart = dateObj.toLocaleTimeString('en-US', {
-                        hour: 'numeric',
-                        minute: '2-digit',
-                        second: '2-digit',
-                        timeZoneName: 'short'
+                        hour: 'numeric', minute: '2-digit', second: '2-digit', timeZoneName: 'short'
                     });
-                    
-                    displayDate = escapeHtml(`${datePart} ${timePart}`);
+                    displayDate = escapeHtml(`${y}-${mo}-${d} ${timePart}`);
                 }
                 
-                // Security: Use escaped values and URL-encode the filename
                 const safeFilename = encodeURIComponent(filename);
-                const escapedFilename = escapeHtml(filename);
-                
                 return `
                     <li class="file-item">
                         <div>
                             <div class="file-name">${displayDate}</div>
-                            <div class="file-meta">${escapedFilename}</div>
+                            <div class="file-meta">${escapeHtml(filename)}</div>
                         </div>
                         <div style="display: flex; gap: 0.5rem;">
                             <a href="${safeFilename}" class="button" target="_blank" rel="noopener noreferrer" style="padding: 0.5rem 1rem; font-size: 0.9rem;">👁️ View</a>
                             <a href="${safeFilename}" class="button" download style="padding: 0.5rem 1rem; font-size: 0.9rem;">⬇️ Download</a>
                         </div>
-                    </li>
-                `;
+                    </li>`;
             }).join('');
             
-            // Add pagination controls if needed
-            if (totalPages > 1) {
-                // Security: Validate page numbers are integers to prevent injection
-                const prevPage = Math.max(0, Math.floor(page - 1));
-                const nextPage = Math.min(totalPages - 1, Math.floor(page + 1));
-                const safePage = Math.floor(page);
-                const safeTotalPages = Math.floor(totalPages);
-                const safeTotal = Math.floor(allFiles.length);
-                
-                html += `
-                    <li class="file-item" style="margin-top: 1rem; border: 1px solid var(--aeo-green); justify-content: center;">
-                        <div style="display: flex; gap: 1rem; align-items: center;">
-                            <button class="button" ${safePage === 0 ? 'disabled' : ''} 
-                                    onclick="displayPage(${prevPage})" 
-                                    style="padding: 0.5rem 1rem; font-size: 0.9rem; ${safePage === 0 ? 'opacity: 0.5; cursor: not-allowed;' : ''}">
-                                ← Previous
-                            </button>
-                            <span style="color: var(--aeo-green);">
-                                Page ${safePage + 1} of ${safeTotalPages} (${safeTotal} total results)
-                            </span>
-                            <button class="button" ${safePage === safeTotalPages - 1 ? 'disabled' : ''} 
-                                    onclick="displayPage(${nextPage})"
-                                    style="padding: 0.5rem 1rem; font-size: 0.9rem; ${safePage === safeTotalPages - 1 ? 'opacity: 0.5; cursor: not-allowed;' : ''}">
-                                Next →
-                            </button>
-                        </div>
-                    </li>
-                `;
-            }
+            // Pagination controls
+            const pagination = totalPages > 1 ? `
+                <li class="file-item" style="margin-top: 1rem; border: 1px solid var(--aeo-green); justify-content: center;">
+                    <div style="display: flex; gap: 1rem; align-items: center;">
+                        <button class="button" ${page === 0 ? 'disabled style="opacity: 0.5; cursor: not-allowed;' : 'style="'}padding: 0.5rem 1rem; font-size: 0.9rem;"
+                                onclick="displayPage(${page - 1})">← Previous</button>
+                        <span style="color: var(--aeo-green);">Page ${page + 1} of ${totalPages} (${allFiles.length} total)</span>
+                        <button class="button" ${page === totalPages - 1 ? 'disabled style="opacity: 0.5; cursor: not-allowed;' : 'style="'}padding: 0.5rem 1rem; font-size: 0.9rem;"
+                                onclick="displayPage(${page + 1})">Next →</button>
+                    </div>
+                </li>` : '';
             
-            fileList.innerHTML = html;
+            fileList.innerHTML = html + pagination;
         }
 
         // Initialize page

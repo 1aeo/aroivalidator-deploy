@@ -7,9 +7,10 @@ set -euo pipefail
 # Security: Use safe umask for created files
 umask 077
 
-# Auto-detect paths
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEPLOY_DIR="$(dirname "$SCRIPT_DIR")"
+# Source shared functions and initialize paths
+source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
+init_paths
+
 PUBLIC_DIR="$DEPLOY_DIR/public"
 LOG_DIR="$DEPLOY_DIR/logs"
 

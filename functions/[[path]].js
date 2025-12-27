@@ -5,60 +5,41 @@
  */
 
 // Cache TTLs in seconds
-const TTL = {
-  latest: 60,           // latest.json, files.json - updates hourly
-  historical: 31536000, // 1 year - immutable timestamped files
-  default: 300,
-};
+const TTL = { latest: 60, historical: 31536000, default: 300 };
+
+// Security: Pattern to detect traversal attempts (encoded or raw)
+const UNSAFE_PATH = /(?:^|\/)\.\.(?:\/|$)|%2e|%00|\x00/i;
+
+// Valid proxy paths pattern
+const PROXY_PATH = /^(?:archives\/.*\.tar\.gz|.*\.json)$/;
 
 const getPath = (params) => {
   const p = Array.isArray(params.path) ? params.path.join('/') : (params.path || '');
-  // Remove leading slash
-  let cleaned = p.startsWith('/') ? p.slice(1) : p;
-  // Security: Prevent path traversal attacks
-  // Remove any ../ sequences and normalize path
-  cleaned = cleaned.split('/').filter(segment => 
-    segment !== '..' && segment !== '.' && segment !== ''
-  ).join('/');
-  // Additional validation: reject paths with encoded traversal or null bytes
-  if (cleaned.includes('%2e') || cleaned.includes('%2E') || 
-      cleaned.includes('%00') || cleaned.includes('\x00')) {
-    return '';
-  }
-  return cleaned;
+  // Normalize: remove leading slash and empty/dot segments in one pass
+  const cleaned = p.replace(/^\/+/, '').split('/').filter(s => s && s !== '.').join('/');
+  // Security: reject paths with traversal attempts
+  return UNSAFE_PATH.test(cleaned) ? '' : cleaned;
 };
 
-const shouldProxy = (path) => {
-  // Validate path is not empty after sanitization
-  if (!path || path.length === 0) return false;
-  return path.endsWith('.json') || path.endsWith('.tar.gz') || path.startsWith('archives/');
-};
+const shouldProxy = (path) => path && PROXY_PATH.test(path);
 
-const isImmutable = (path) =>
-  path.startsWith('aroi_validation_') || path.startsWith('archives/');
+const isImmutable = (path) => path[0] === 'a';  // 'aroi_validation_*' or 'archives/*'
 
 const getCacheTTL = (path, env) => {
   if (path === 'latest.json' || path === 'files.json') 
     return parseInt(env.CACHE_TTL_LATEST) || TTL.latest;
-  if (isImmutable(path))
-    return parseInt(env.CACHE_TTL_HISTORICAL) || TTL.historical;
-  return TTL.default;
+  return isImmutable(path) ? (parseInt(env.CACHE_TTL_HISTORICAL) || TTL.historical) : TTL.default;
 };
 
 const makeResponse = (body, path, source, ttl) => {
   const immutable = isImmutable(path);
+  const cacheControl = `public, max-age=${ttl}${immutable ? ', immutable' : ''}`;
   return new Response(body, {
     headers: {
       'Content-Type': path.endsWith('.json') ? 'application/json' : 'application/octet-stream',
-      'Cache-Control': immutable 
-        ? `public, max-age=${ttl}, immutable` 
-        : `public, max-age=${ttl}`,
-      'CDN-Cache-Control': immutable
-        ? `public, max-age=${ttl}, immutable`
-        : `public, max-age=${ttl}`,
+      'Cache-Control': cacheControl,
+      'CDN-Cache-Control': cacheControl,
       'X-Served-From': source,
-      'X-Immutable': immutable ? 'true' : 'false',
-      // Security headers
       'X-Content-Type-Options': 'nosniff',
       'X-Frame-Options': 'DENY',
     },

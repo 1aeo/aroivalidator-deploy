@@ -3,21 +3,16 @@
 # Uploads to DO Spaces (primary) and R2 (backup) in parallel
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEPLOY_DIR="$(dirname "$SCRIPT_DIR")"
+# Source shared functions and initialize paths
+source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
+init_paths
+load_config || true
+
 CODE_DIR="$HOME/aroivalidator"
 LOG_DIR="$DEPLOY_DIR/logs"
 WEB_DIR="$DEPLOY_DIR/public"
 LOCK_FILE="$LOG_DIR/validation.lock"
 
-# Security: Validate config before sourcing
-if [[ -f "$DEPLOY_DIR/config.env" ]]; then
-    CONFIG_PERMS=$(stat -c '%a' "$DEPLOY_DIR/config.env" 2>/dev/null || echo "644")
-    if [[ "${CONFIG_PERMS: -1}" != "0" && "${CONFIG_PERMS: -1}" != "4" ]]; then
-        echo "Warning: config.env has insecure permissions ($CONFIG_PERMS)"
-    fi
-    source "$DEPLOY_DIR/config.env"
-fi
 : "${CLOUD_UPLOAD:=true}" "${DO_ENABLED:=false}" "${R2_ENABLED:=false}"
 
 mkdir -p "$LOG_DIR" "$WEB_DIR"
@@ -34,20 +29,17 @@ trap 'rm -f "$LOCK_FILE"' EXIT
 
 echo "=== AROI Batch $(date) ==="
 
-cd "$CODE_DIR"
-[[ -d ".git" ]] || { echo "Not a git repo"; exit 1; }
+# Validate CODE_DIR is a git repo and update if from trusted source
+[[ -d "$CODE_DIR/.git" ]] || { echo "Not a git repo: $CODE_DIR"; exit 1; }
 
-# Update code repository
-# Security note: Only fetch/reset if CODE_DIR is a valid git repo we control
-if [[ -d "$CODE_DIR/.git" ]]; then
-    # Verify remote URL is from expected source before pulling
-    REMOTE_URL=$(git -C "$CODE_DIR" config --get remote.origin.url 2>/dev/null || echo "")
-    if [[ "$REMOTE_URL" == *"github.com/1aeo/AROIValidator"* || "$REMOTE_URL" == *"github.com:1aeo/AROIValidator"* ]]; then
-        git -C "$CODE_DIR" fetch origin main 2>/dev/null && git -C "$CODE_DIR" reset --hard origin/main 2>/dev/null || true
-    else
-        echo "Warning: Skipping auto-update - unexpected remote URL"
-    fi
+# Security: Only fetch/reset if remote URL is from expected source
+REMOTE_URL=$(git -C "$CODE_DIR" config --get remote.origin.url 2>/dev/null || echo "")
+if [[ "$REMOTE_URL" == *"github.com/1aeo/AROIValidator"* || "$REMOTE_URL" == *"github.com:1aeo/AROIValidator"* ]]; then
+    git -C "$CODE_DIR" fetch origin main 2>/dev/null && git -C "$CODE_DIR" reset --hard origin/main 2>/dev/null || true
+else
+    echo "Warning: Skipping auto-update - unexpected remote URL"
 fi
+
 source "$CODE_DIR/venv/bin/activate"
 
 echo "Running validation..."

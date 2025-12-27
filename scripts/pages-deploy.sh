@@ -3,24 +3,17 @@
 # Generates wrangler.toml and deploys frontend with Pages Functions.
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEPLOY_DIR="$(dirname "$SCRIPT_DIR")"
-CONFIG="$DEPLOY_DIR/config.env"
+# Source shared functions and initialize paths
+source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
+init_paths
 
-log() { echo "[$(date '+%H:%M:%S')] $1"; }
 err() { echo "✗ $1" >&2; exit 1; }
 
 [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]] && { echo "Usage: $0 [--dry-run]"; exit 0; }
 DRY_RUN=$([[ "${1:-}" == "--dry-run" ]] && echo true || echo false)
 
-# Load config with security validation
-[[ -f "$CONFIG" ]] || err "config.env not found"
-# Security: Check config file permissions
-CONFIG_PERMS=$(stat -c '%a' "$CONFIG" 2>/dev/null || echo "644")
-if [[ "${CONFIG_PERMS: -1}" != "0" && "${CONFIG_PERMS: -1}" != "4" ]]; then
-    log "Warning: config.env has insecure permissions ($CONFIG_PERMS). Consider: chmod 600 $CONFIG"
-fi
-source "$CONFIG"
+# Load config
+load_config || err "config.env not found"
 
 # Check dependencies
 command -v node &>/dev/null || err "Node.js required (apt install nodejs npm)"

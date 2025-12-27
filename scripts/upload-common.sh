@@ -5,36 +5,20 @@
 
 set -euo pipefail
 
+# Source shared functions
+source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
+
 # Remote names (unique to this project)
 AROI_R2_REMOTE="aroi-r2"
 AROI_DO_REMOTE="aroi-spaces"
 
-# Logging
-log()         { echo "[$(date '+%H:%M:%S')]${STORAGE_NAME:+ [$STORAGE_NAME]} $1"; }
-log_error()   { echo "[$(date '+%H:%M:%S')] ❌ $1" >&2; }
-log_success() { echo "[$(date '+%H:%M:%S')] ✅ $1"; }
-
-# Security: Validate config.env before sourcing
-validate_config() {
-    local config_file="$1"
-    [[ -f "$config_file" ]] || return 1
-    # Check config file is not world-writable
-    local perms
-    perms=$(stat -c '%a' "$config_file" 2>/dev/null || echo "644")
-    if [[ "${perms: -1}" != "0" && "${perms: -1}" != "4" ]]; then
-        log_error "Warning: $config_file has insecure permissions ($perms). Consider: chmod 600 $config_file"
-    fi
-    return 0
-}
+# Cached rclone options (populated by init_upload)
+declare -a RCLONE_OPTS_ARRAY=()
 
 # Initialize paths and config
 init_upload() {
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[1]}")" && pwd)"
-    DEPLOY_DIR="$(dirname "$SCRIPT_DIR")"
-    if [[ -f "$DEPLOY_DIR/config.env" ]]; then
-        validate_config "$DEPLOY_DIR/config.env"
-        source "$DEPLOY_DIR/config.env"
-    fi
+    init_paths 2  # Use grandparent caller's location
+    load_config || true
     
     SOURCE_DIR="${1:-${OUTPUT_DIR:-$DEPLOY_DIR/public}}"
     BACKUP_DIR="${BACKUP_DIR:-$DEPLOY_DIR/backups}"
@@ -47,17 +31,18 @@ init_upload() {
     
     # Rclone defaults (can override per-backend)
     : "${TRANSFERS:=64}" "${CHECKERS:=128}" "${BUFFER:=64M}" "${S3_CONC:=16}" "${S3_CHUNK:=16M}"
+    
+    # Cache rclone options array once
+    RCLONE_OPTS_ARRAY=(
+        "--transfers=$TRANSFERS" "--checkers=$CHECKERS" "--buffer-size=$BUFFER"
+        "--s3-upload-concurrency=$S3_CONC" "--s3-chunk-size=$S3_CHUNK"
+        "--fast-list" "--stats=10s" "--stats-one-line" "--log-level=NOTICE"
+        "--retries=5" "--retries-sleep=2s" "--low-level-retries=10"
+    )
 }
 
 check_rclone() {
     [[ -x "$RCLONE" ]] || { log_error "rclone not found at $RCLONE"; return 1; }
-}
-
-rclone_opts() {
-    echo "--transfers=$TRANSFERS --checkers=$CHECKERS --buffer-size=$BUFFER"
-    echo "--s3-upload-concurrency=$S3_CONC --s3-chunk-size=$S3_CHUNK"
-    echo "--fast-list --stats=10s --stats-one-line --log-level=NOTICE"
-    echo "--retries=5 --retries-sleep=2s --low-level-retries=10"
 }
 
 # Remote setup (creates if not exists)
@@ -97,19 +82,15 @@ maybe_backup() {
     [[ "$force" == "true" ]] || { [[ -f "$marker" && "$(cat "$marker")" == "$TODAY" ]] && return 1; }
     
     local target
-    # Security: Build options array to avoid word splitting issues
-    local -a opts_array
-    readarray -t opts_array < <(rclone_opts)
-    
     if [[ "$type" == "local" ]]; then
         target="$BACKUP_DIR/backup-$TIMESTAMP"
         log "Local backup → $target"
         mkdir -p "$target"
-        "$RCLONE" sync "$bucket" "$target" --exclude "_backups/**" "${opts_array[@]}" 2>&1 | head -5
+        "$RCLONE" sync "$bucket" "$target" --exclude "_backups/**" "${RCLONE_OPTS_ARRAY[@]}" 2>&1 | head -5
     else
         target="$bucket/_backups/$TIMESTAMP"
         log "Remote backup → $target"
-        "$RCLONE" sync "$bucket" "$target" --exclude "_backups/**" "${opts_array[@]}" 2>&1 | head -5
+        "$RCLONE" sync "$bucket" "$target" --exclude "_backups/**" "${RCLONE_OPTS_ARRAY[@]}" 2>&1 | head -5
     fi
     echo "$TODAY" > "$marker"
     log_success "${type^} backup done"
@@ -118,12 +99,8 @@ maybe_backup() {
 # Main upload function
 do_upload() {
     local bucket="$1"
-    # Security: Build options array to avoid word splitting issues
-    local -a opts_array
-    readarray -t opts_array < <(rclone_opts)
-    
     log "Syncing $SOURCE_DIR → $bucket"
-    "$RCLONE" sync "$SOURCE_DIR" "$bucket" --exclude "_backups/**" --exclude "index.html" "${opts_array[@]}" 2>&1 | head -10
+    "$RCLONE" sync "$SOURCE_DIR" "$bucket" --exclude "_backups/**" --exclude "index.html" "${RCLONE_OPTS_ARRAY[@]}" 2>&1 | head -10
     log_success "Upload complete"
 }
 
