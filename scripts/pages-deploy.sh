@@ -13,8 +13,13 @@ err() { echo "✗ $1" >&2; exit 1; }
 [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]] && { echo "Usage: $0 [--dry-run]"; exit 0; }
 DRY_RUN=$([[ "${1:-}" == "--dry-run" ]] && echo true || echo false)
 
-# Load config
+# Load config with security validation
 [[ -f "$CONFIG" ]] || err "config.env not found"
+# Security: Check config file permissions
+CONFIG_PERMS=$(stat -c '%a' "$CONFIG" 2>/dev/null || echo "644")
+if [[ "${CONFIG_PERMS: -1}" != "0" && "${CONFIG_PERMS: -1}" != "4" ]]; then
+    log "Warning: config.env has insecure permissions ($CONFIG_PERMS). Consider: chmod 600 $CONFIG"
+fi
 source "$CONFIG"
 
 # Check dependencies

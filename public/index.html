@@ -4,6 +4,11 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="description" content="AROI Validator - Automated validation of Authenticated Relay Operator IDs">
+    <!-- Security: Content Security Policy -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self';">
+    <meta http-equiv="X-Content-Type-Options" content="nosniff">
+    <meta http-equiv="X-Frame-Options" content="DENY">
+    <meta name="referrer" content="strict-origin-when-cross-origin">
     <title>AROI Validator - Tor Relay Verification Results</title>
     <style>
         /* 1AEO Brand Design Tokens */
@@ -412,7 +417,7 @@
             </ul>
             <p style="color: var(--aeo-text-muted); margin-top: 1rem; font-size: 0.9rem;">
                 Learn more about the 
-                <a href="https://nusenu.github.io/tor-relay-operator-ids-trust-information/" target="_blank">
+                <a href="https://nusenu.github.io/tor-relay-operator-ids-trust-information/" target="_blank" rel="noopener noreferrer">
                     AROI framework and trust methodology
                 </a>
             </p>
@@ -421,17 +426,17 @@
 
     <footer class="aeo-footer">
         <div class="aeo-footer-links">
-            <a href="https://metrics.1aeo.com">Metrics</a>
-            <a href="https://aroivalidator.1aeo.com">AROI Validator</a>
-            <a href="https://routefluxmap.1aeo.com">RouteFluxMap</a>
-            <a href="https://github.com/1aeo">GitHub</a>
+            <a href="https://metrics.1aeo.com" rel="noopener noreferrer">Metrics</a>
+            <a href="https://aroivalidator.1aeo.com" rel="noopener noreferrer">AROI Validator</a>
+            <a href="https://routefluxmap.1aeo.com" rel="noopener noreferrer">RouteFluxMap</a>
+            <a href="https://github.com/1aeo" rel="noopener noreferrer">GitHub</a>
         </div>
         <p class="aeo-footer-brand">
-            Part of <a href="https://www.1aeo.com" style="font-weight: bold;">1st Amendment Encrypted Openness LLC</a>
+            Part of <a href="https://www.1aeo.com" style="font-weight: bold;" rel="noopener noreferrer">1st Amendment Encrypted Openness LLC</a>
         </p>
         <p class="aeo-footer-legal">
-            Automated validation runs hourly. Data sourced from <a href="https://onionoo.torproject.org/">Tor Project Onionoo</a>. 
-            Learn about the <a href="https://nusenu.github.io/tor-relay-operator-ids-trust-information/">AROI methodology</a>.
+            Automated validation runs hourly. Data sourced from <a href="https://onionoo.torproject.org/" rel="noopener noreferrer">Tor Project Onionoo</a>. 
+            Learn about the <a href="https://nusenu.github.io/tor-relay-operator-ids-trust-information/" rel="noopener noreferrer">AROI methodology</a>.
         </p>
     </footer>
 
@@ -520,6 +525,20 @@
             }
         }
 
+        // Security: Escape HTML to prevent XSS
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // Security: Validate filename format to prevent injection
+        function isValidFilename(filename) {
+            // Only allow expected filename patterns
+            return /^aroi_validation_\d{8}_\d{6}\.json$/.test(filename) ||
+                   /^archives\/aroi-\d{6}\.tar\.gz$/.test(filename);
+        }
+
         // Display a specific page of results
         function displayPage(page) {
             const fileList = document.getElementById('file-list');
@@ -532,9 +551,15 @@
             
             // Display files
             let html = pageFiles.map(filename => {
+                // Security: Validate filename before processing
+                if (!isValidFilename(filename)) {
+                    console.warn('Invalid filename rejected:', filename);
+                    return '';
+                }
+                
                 // Extract date from filename: aroi_validation_YYYYMMDD_HHMMSS.json
                 const match = filename.match(/(\d{8})_(\d{6})/);
-                let displayDate = filename;
+                let displayDate = escapeHtml(filename);
                 
                 if (match) {
                     const dateStr = match[1];
@@ -560,18 +585,22 @@
                         timeZoneName: 'short'
                     });
                     
-                    displayDate = `${datePart} ${timePart}`;
+                    displayDate = escapeHtml(`${datePart} ${timePart}`);
                 }
+                
+                // Security: Use escaped values and URL-encode the filename
+                const safeFilename = encodeURIComponent(filename);
+                const escapedFilename = escapeHtml(filename);
                 
                 return `
                     <li class="file-item">
                         <div>
                             <div class="file-name">${displayDate}</div>
-                            <div class="file-meta">${filename}</div>
+                            <div class="file-meta">${escapedFilename}</div>
                         </div>
                         <div style="display: flex; gap: 0.5rem;">
-                            <a href="${filename}" class="button" target="_blank" style="padding: 0.5rem 1rem; font-size: 0.9rem;">👁️ View</a>
-                            <a href="${filename}" class="button" download style="padding: 0.5rem 1rem; font-size: 0.9rem;">⬇️ Download</a>
+                            <a href="${safeFilename}" class="button" target="_blank" rel="noopener noreferrer" style="padding: 0.5rem 1rem; font-size: 0.9rem;">👁️ View</a>
+                            <a href="${safeFilename}" class="button" download style="padding: 0.5rem 1rem; font-size: 0.9rem;">⬇️ Download</a>
                         </div>
                     </li>
                 `;
@@ -579,20 +608,27 @@
             
             // Add pagination controls if needed
             if (totalPages > 1) {
+                // Security: Validate page numbers are integers to prevent injection
+                const prevPage = Math.max(0, Math.floor(page - 1));
+                const nextPage = Math.min(totalPages - 1, Math.floor(page + 1));
+                const safePage = Math.floor(page);
+                const safeTotalPages = Math.floor(totalPages);
+                const safeTotal = Math.floor(allFiles.length);
+                
                 html += `
                     <li class="file-item" style="margin-top: 1rem; border: 1px solid var(--aeo-green); justify-content: center;">
                         <div style="display: flex; gap: 1rem; align-items: center;">
-                            <button class="button" ${page === 0 ? 'disabled' : ''} 
-                                    onclick="displayPage(${page - 1})" 
-                                    style="padding: 0.5rem 1rem; font-size: 0.9rem; ${page === 0 ? 'opacity: 0.5; cursor: not-allowed;' : ''}">
+                            <button class="button" ${safePage === 0 ? 'disabled' : ''} 
+                                    onclick="displayPage(${prevPage})" 
+                                    style="padding: 0.5rem 1rem; font-size: 0.9rem; ${safePage === 0 ? 'opacity: 0.5; cursor: not-allowed;' : ''}">
                                 ← Previous
                             </button>
                             <span style="color: var(--aeo-green);">
-                                Page ${page + 1} of ${totalPages} (${allFiles.length} total results)
+                                Page ${safePage + 1} of ${safeTotalPages} (${safeTotal} total results)
                             </span>
-                            <button class="button" ${page === totalPages - 1 ? 'disabled' : ''} 
-                                    onclick="displayPage(${page + 1})"
-                                    style="padding: 0.5rem 1rem; font-size: 0.9rem; ${page === totalPages - 1 ? 'opacity: 0.5; cursor: not-allowed;' : ''}">
+                            <button class="button" ${safePage === safeTotalPages - 1 ? 'disabled' : ''} 
+                                    onclick="displayPage(${nextPage})"
+                                    style="padding: 0.5rem 1rem; font-size: 0.9rem; ${safePage === safeTotalPages - 1 ? 'opacity: 0.5; cursor: not-allowed;' : ''}">
                                 Next →
                             </button>
                         </div>

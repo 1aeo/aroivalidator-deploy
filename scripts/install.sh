@@ -17,18 +17,29 @@ echo -e "${BLUE}║           AROI Validator - Installation                     
 echo -e "${BLUE}╚═══════════════════════════════════════════════════════════════╝${NC}"
 echo ""
 
-# Detect user and paths
+# Detect user and paths (avoid eval for security)
 if [[ $EUID -eq 0 ]]; then
-    ACTUAL_USER=${SUDO_USER:-$(logname 2>/dev/null || echo $USER)}
+    ACTUAL_USER=${SUDO_USER:-$(logname 2>/dev/null || echo "$USER")}
 else
-    ACTUAL_USER=$USER
+    ACTUAL_USER="$USER"
 fi
-USER_HOME=$(eval echo ~$ACTUAL_USER)
+# Validate username contains only safe characters (alphanumeric, underscore, hyphen)
+[[ "$ACTUAL_USER" =~ ^[a-zA-Z0-9_-]+$ ]] || err "Invalid username detected: $ACTUAL_USER"
+# Use getent for secure home directory lookup instead of eval
+USER_HOME=$(getent passwd "$ACTUAL_USER" | cut -d: -f6)
+[[ -n "$USER_HOME" && -d "$USER_HOME" ]] || err "Could not determine home directory for user: $ACTUAL_USER"
 DEPLOY_DIR="$USER_HOME/aroivalidator-deploy"
 CODE_DIR="$USER_HOME/aroivalidator"
 
-# Load config
+# Load config with validation
 [[ -f "$DEPLOY_DIR/config.env" ]] || err "config.env not found. Copy config.env.example first."
+# Security check: config.env should be owned by current user or root and not world-writable
+if [[ $EUID -eq 0 ]]; then
+    CONFIG_OWNER=$(stat -c '%U' "$DEPLOY_DIR/config.env" 2>/dev/null)
+    [[ "$CONFIG_OWNER" == "root" || "$CONFIG_OWNER" == "$ACTUAL_USER" ]] || err "config.env has unsafe ownership"
+fi
+CONFIG_PERMS=$(stat -c '%a' "$DEPLOY_DIR/config.env" 2>/dev/null)
+[[ "${CONFIG_PERMS: -1}" == "0" || "${CONFIG_PERMS: -1}" == "4" ]] || warn "config.env is world-readable/writable. Run: chmod 600 config.env"
 source "$DEPLOY_DIR/config.env"
 
 # Determine mode

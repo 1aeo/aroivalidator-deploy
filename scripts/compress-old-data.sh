@@ -4,6 +4,9 @@
 
 set -euo pipefail
 
+# Security: Use safe umask for created files
+umask 077
+
 # Auto-detect paths
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEPLOY_DIR="$(dirname "$SCRIPT_DIR")"
@@ -34,25 +37,39 @@ MONTHS_TO_COMPRESS=$(find "$PUBLIC_DIR" -maxdepth 1 -name "aroi_validation_*.jso
 
 if [ -n "$MONTHS_TO_COMPRESS" ]; then
     for MONTH in $MONTHS_TO_COMPRESS; do
+        # Security: Validate MONTH format (should be 6 digits YYYYMM)
+        if ! echo "$MONTH" | grep -qE '^[0-9]{6}$'; then
+            echo "  ⚠ Skipping invalid month format: $MONTH"
+            continue
+        fi
+        
         ARCHIVE_NAME="aroi-$MONTH.tar.gz"
         ARCHIVE_PATH="$PUBLIC_DIR/archives/$ARCHIVE_NAME"
         
         echo "Processing month: $MONTH"
         
-        # Find all files for this month
-        FILES_TO_COMPRESS=$(find "$PUBLIC_DIR" -maxdepth 1 -name "aroi_validation_${MONTH}*.json" -mtime +180 -type f 2>/dev/null)
+        # Find all files for this month using null-delimited output for safety
+        mapfile -d '' FILES_ARRAY < <(find "$PUBLIC_DIR" -maxdepth 1 -name "aroi_validation_${MONTH}*.json" -mtime +180 -type f -print0 2>/dev/null)
         
-        if [ -n "$FILES_TO_COMPRESS" ]; then
-            FILE_COUNT=$(echo "$FILES_TO_COMPRESS" | wc -l)
+        if [ ${#FILES_ARRAY[@]} -gt 0 ]; then
+            FILE_COUNT=${#FILES_ARRAY[@]}
             echo "  Found $FILE_COUNT files for $MONTH"
             
+            # Security: Build basename list safely without command injection
+            BASENAMES=()
+            for f in "${FILES_ARRAY[@]}"; do
+                BASENAMES+=("$(basename "$f")")
+            done
+            
             # Create archive with all files for this month
-            tar czf "$ARCHIVE_PATH" -C "$PUBLIC_DIR" $(echo "$FILES_TO_COMPRESS" | xargs -n1 basename) 2>/dev/null
+            tar czf "$ARCHIVE_PATH" -C "$PUBLIC_DIR" "${BASENAMES[@]}" 2>/dev/null
             
             # Verify archive was created and contains files
             if [ -f "$ARCHIVE_PATH" ] && tar tzf "$ARCHIVE_PATH" >/dev/null 2>&1; then
                 # Archive verified, safe to delete originals
-                echo "$FILES_TO_COMPRESS" | xargs -r rm -f
+                for f in "${FILES_ARRAY[@]}"; do
+                    rm -f "$f"
+                done
                 chmod 644 "$ARCHIVE_PATH"
                 echo "  ✓ Compressed $FILE_COUNT files → $ARCHIVE_NAME"
             else
@@ -70,26 +87,40 @@ echo "Checking cron.log size..."
 
 if [ -f "$LOG_DIR/cron.log" ]; then
     LOG_SIZE=$(stat -c%s "$LOG_DIR/cron.log" 2>/dev/null || echo 0)
+    # Security: Validate LOG_SIZE is a number
+    if ! [[ "$LOG_SIZE" =~ ^[0-9]+$ ]]; then
+        LOG_SIZE=0
+    fi
     LOG_SIZE_MB=$((LOG_SIZE / 1048576))
     
     if [ "$LOG_SIZE_MB" -gt 50 ]; then
-        ARCHIVE_NAME="cron-$(date +%Y-%m).log.gz"
-        
-        echo "cron.log is ${LOG_SIZE_MB}MB, compressing..."
-        
-        # Compress entire log
-        gzip -9 -c "$LOG_DIR/cron.log" > "$LOG_DIR/archives/$ARCHIVE_NAME"
-        
-        # Verify compression
-        if [ -f "$LOG_DIR/archives/$ARCHIVE_NAME" ] && gunzip -t "$LOG_DIR/archives/$ARCHIVE_NAME" 2>/dev/null; then
-            # Keep only last 500 lines in current log
-            tail -500 "$LOG_DIR/cron.log" > "$LOG_DIR/cron.log.new"
-            mv "$LOG_DIR/cron.log.new" "$LOG_DIR/cron.log"
-            chmod 644 "$LOG_DIR/archives/$ARCHIVE_NAME"
-            echo "  ✓ Compressed to $ARCHIVE_NAME"
+        # Security: Use safe date format and validate
+        DATE_PART=$(date +%Y-%m)
+        if [[ "$DATE_PART" =~ ^[0-9]{4}-[0-9]{2}$ ]]; then
+            ARCHIVE_NAME="cron-${DATE_PART}.log.gz"
         else
-            echo "  ✗ Compression verification failed"
-            rm -f "$LOG_DIR/archives/$ARCHIVE_NAME"
+            echo "  ⚠ Invalid date format, skipping log compression"
+            ARCHIVE_NAME=""
+        fi
+        
+        if [ -n "$ARCHIVE_NAME" ]; then
+            echo "cron.log is ${LOG_SIZE_MB}MB, compressing..."
+            
+            # Compress entire log
+            gzip -9 -c "$LOG_DIR/cron.log" > "$LOG_DIR/archives/$ARCHIVE_NAME"
+            
+            # Verify compression
+            if [ -f "$LOG_DIR/archives/$ARCHIVE_NAME" ] && gunzip -t "$LOG_DIR/archives/$ARCHIVE_NAME" 2>/dev/null; then
+                # Keep only last 500 lines in current log (use temp file safely)
+                TEMP_FILE=$(mktemp "$LOG_DIR/cron.log.XXXXXX")
+                tail -500 "$LOG_DIR/cron.log" > "$TEMP_FILE"
+                mv "$TEMP_FILE" "$LOG_DIR/cron.log"
+                chmod 644 "$LOG_DIR/archives/$ARCHIVE_NAME"
+                echo "  ✓ Compressed to $ARCHIVE_NAME"
+            else
+                echo "  ✗ Compression verification failed"
+                rm -f "$LOG_DIR/archives/$ARCHIVE_NAME"
+            fi
         fi
     else
         echo "cron.log is ${LOG_SIZE_MB}MB (under 50MB threshold)"

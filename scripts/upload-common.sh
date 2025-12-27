@@ -14,11 +14,27 @@ log()         { echo "[$(date '+%H:%M:%S')]${STORAGE_NAME:+ [$STORAGE_NAME]} $1"
 log_error()   { echo "[$(date '+%H:%M:%S')] ❌ $1" >&2; }
 log_success() { echo "[$(date '+%H:%M:%S')] ✅ $1"; }
 
+# Security: Validate config.env before sourcing
+validate_config() {
+    local config_file="$1"
+    [[ -f "$config_file" ]] || return 1
+    # Check config file is not world-writable
+    local perms
+    perms=$(stat -c '%a' "$config_file" 2>/dev/null || echo "644")
+    if [[ "${perms: -1}" != "0" && "${perms: -1}" != "4" ]]; then
+        log_error "Warning: $config_file has insecure permissions ($perms). Consider: chmod 600 $config_file"
+    fi
+    return 0
+}
+
 # Initialize paths and config
 init_upload() {
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[1]}")" && pwd)"
     DEPLOY_DIR="$(dirname "$SCRIPT_DIR")"
-    [[ -f "$DEPLOY_DIR/config.env" ]] && source "$DEPLOY_DIR/config.env"
+    if [[ -f "$DEPLOY_DIR/config.env" ]]; then
+        validate_config "$DEPLOY_DIR/config.env"
+        source "$DEPLOY_DIR/config.env"
+    fi
     
     SOURCE_DIR="${1:-${OUTPUT_DIR:-$DEPLOY_DIR/public}}"
     BACKUP_DIR="${BACKUP_DIR:-$DEPLOY_DIR/backups}"
@@ -77,19 +93,23 @@ ensure_do_remote() {
 
 # Backup if not done today (returns 0 if backup made, 1 if skipped)
 maybe_backup() {
-    local bucket=$1 marker=$2 type=$3 force=${4:-false}
+    local bucket="$1" marker="$2" type="$3" force="${4:-false}"
     [[ "$force" == "true" ]] || { [[ -f "$marker" && "$(cat "$marker")" == "$TODAY" ]] && return 1; }
     
-    local target opts; opts=$(rclone_opts | tr '\n' ' ')
+    local target
+    # Security: Build options array to avoid word splitting issues
+    local -a opts_array
+    readarray -t opts_array < <(rclone_opts)
+    
     if [[ "$type" == "local" ]]; then
         target="$BACKUP_DIR/backup-$TIMESTAMP"
         log "Local backup → $target"
         mkdir -p "$target"
-        $RCLONE sync "$bucket" "$target" --exclude "_backups/**" $opts 2>&1 | head -5
+        "$RCLONE" sync "$bucket" "$target" --exclude "_backups/**" "${opts_array[@]}" 2>&1 | head -5
     else
         target="$bucket/_backups/$TIMESTAMP"
         log "Remote backup → $target"
-        $RCLONE sync "$bucket" "$target" --exclude "_backups/**" $opts 2>&1 | head -5
+        "$RCLONE" sync "$bucket" "$target" --exclude "_backups/**" "${opts_array[@]}" 2>&1 | head -5
     fi
     echo "$TODAY" > "$marker"
     log_success "${type^} backup done"
@@ -97,10 +117,13 @@ maybe_backup() {
 
 # Main upload function
 do_upload() {
-    local bucket=$1 opts
-    opts=$(rclone_opts | tr '\n' ' ')
+    local bucket="$1"
+    # Security: Build options array to avoid word splitting issues
+    local -a opts_array
+    readarray -t opts_array < <(rclone_opts)
+    
     log "Syncing $SOURCE_DIR → $bucket"
-    $RCLONE sync "$SOURCE_DIR" "$bucket" --exclude "_backups/**" --exclude "index.html" $opts 2>&1 | head -10
+    "$RCLONE" sync "$SOURCE_DIR" "$bucket" --exclude "_backups/**" --exclude "index.html" "${opts_array[@]}" 2>&1 | head -10
     log_success "Upload complete"
 }
 

@@ -13,11 +13,26 @@ const TTL = {
 
 const getPath = (params) => {
   const p = Array.isArray(params.path) ? params.path.join('/') : (params.path || '');
-  return p.startsWith('/') ? p.slice(1) : p;
+  // Remove leading slash
+  let cleaned = p.startsWith('/') ? p.slice(1) : p;
+  // Security: Prevent path traversal attacks
+  // Remove any ../ sequences and normalize path
+  cleaned = cleaned.split('/').filter(segment => 
+    segment !== '..' && segment !== '.' && segment !== ''
+  ).join('/');
+  // Additional validation: reject paths with encoded traversal or null bytes
+  if (cleaned.includes('%2e') || cleaned.includes('%2E') || 
+      cleaned.includes('%00') || cleaned.includes('\x00')) {
+    return '';
+  }
+  return cleaned;
 };
 
-const shouldProxy = (path) => 
-  path.endsWith('.json') || path.endsWith('.tar.gz') || path.startsWith('archives/');
+const shouldProxy = (path) => {
+  // Validate path is not empty after sanitization
+  if (!path || path.length === 0) return false;
+  return path.endsWith('.json') || path.endsWith('.tar.gz') || path.startsWith('archives/');
+};
 
 const isImmutable = (path) =>
   path.startsWith('aroi_validation_') || path.startsWith('archives/');
@@ -43,7 +58,9 @@ const makeResponse = (body, path, source, ttl) => {
         : `public, max-age=${ttl}`,
       'X-Served-From': source,
       'X-Immutable': immutable ? 'true' : 'false',
-      'Access-Control-Allow-Origin': '*',
+      // Security headers
+      'X-Content-Type-Options': 'nosniff',
+      'X-Frame-Options': 'DENY',
     },
   });
 };
@@ -90,8 +107,9 @@ export async function onRequest({ request, env, params, next, waitUntil }) {
     }
   }
 
-  return new Response(`Not Found: ${path}`, { 
+  // Security: Don't leak requested path in error messages
+  return new Response('Not Found', { 
     status: 404, 
-    headers: { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' }
+    headers: { 'Content-Type': 'text/plain' }
   });
 }
