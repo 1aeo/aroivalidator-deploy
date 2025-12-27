@@ -32,15 +32,17 @@ echo "=== AROI Batch $(date) ==="
 # Validate CODE_DIR is a git repo and update if from trusted source
 [[ -d "$CODE_DIR/.git" ]] || { echo "Not a git repo: $CODE_DIR"; exit 1; }
 
-# Security: Only fetch/reset if remote URL is from expected source
+# Security: Only fetch/reset if remote URL is from expected source (case-insensitive)
 REMOTE_URL=$(git -C "$CODE_DIR" config --get remote.origin.url 2>/dev/null || echo "")
-if [[ "$REMOTE_URL" == *"github.com/1aeo/AROIValidator"* || "$REMOTE_URL" == *"github.com:1aeo/AROIValidator"* ]]; then
+REMOTE_URL_LOWER="${REMOTE_URL,,}"  # Convert to lowercase for comparison
+if [[ "$REMOTE_URL_LOWER" == *"github.com/1aeo/aroivalidator"* || "$REMOTE_URL_LOWER" == *"github.com:1aeo/aroivalidator"* ]]; then
     git -C "$CODE_DIR" fetch origin main 2>/dev/null && git -C "$CODE_DIR" reset --hard origin/main 2>/dev/null || true
 else
-    echo "Warning: Skipping auto-update - unexpected remote URL"
+    echo "Warning: Skipping auto-update - unexpected remote URL: $REMOTE_URL"
 fi
 
-source "$CODE_DIR/venv/bin/activate"
+cd "$CODE_DIR"
+source venv/bin/activate
 
 echo "Running validation..."
 BATCH_LIMIT=0 PARALLEL=true MAX_WORKERS=10 python3 aroi_cli.py batch || { echo "Validation failed"; exit 1; }
