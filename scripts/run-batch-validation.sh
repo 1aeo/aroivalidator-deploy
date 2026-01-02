@@ -45,7 +45,7 @@ cd "$CODE_DIR"
 source venv/bin/activate
 
 echo "Running validation..."
-BATCH_LIMIT=0 PARALLEL=true MAX_WORKERS=10 python3 aroi_cli.py batch || { echo "Validation failed"; exit 1; }
+BATCH_LIMIT=0 PARALLEL=true MAX_WORKERS=20 python3 aroi_cli.py batch || { echo "Validation failed"; exit 1; }
 
 # Publish results
 SRC="$CODE_DIR/validation_results"
@@ -54,12 +54,14 @@ if [[ -d "$SRC" ]]; then
     rsync -a --include='*.json' --exclude='*' "$SRC/" "$WEB_DIR/" 2>/dev/null || \
         find "$SRC" -maxdepth 1 -name "*.json" -newer "$WEB_DIR/files.json" -exec cp {} "$WEB_DIR/" \; 2>/dev/null
     
-    LATEST=$(ls -t "$SRC"/aroi_validation_*.json 2>/dev/null | head -1)
+    # Subshell disables pipefail to avoid SIGPIPE from head closing the pipe early
+    LATEST=$(set +o pipefail; ls -t "$SRC"/aroi_validation_*.json 2>/dev/null | head -1)
     [[ -n "$LATEST" ]] && cp -f "$LATEST" "$WEB_DIR/latest.json" && echo "Latest: $(basename "$LATEST")"
     
-    # File manifest
+    # File manifest (atomic write to prevent corruption)
     find "$WEB_DIR" -maxdepth 1 -name "aroi_validation_*.json" -printf '%f\n' 2>/dev/null \
-        | sort -r | jq -Rs 'split("\n") | map(select(length > 0))' > "$WEB_DIR/files.json"
+        | sort -r | jq -Rs 'split("\n") | map(select(length > 0))' > "$WEB_DIR/files.json.tmp" \
+        && mv "$WEB_DIR/files.json.tmp" "$WEB_DIR/files.json"
 fi
 
 # Cloud upload (parallel)
