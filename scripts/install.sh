@@ -154,24 +154,52 @@ fi
 
 # === Cron Jobs ===
 log "Setting up cron..."
-export DEPLOY_DIR USER_HOME
-CRON_HOURLY=$(envsubst < "$DEPLOY_DIR/configs/aroivalidator.cron.template" 2>/dev/null || echo "5 * * * * $DEPLOY_DIR/scripts/run-batch-validation.sh >> $DEPLOY_DIR/logs/cron.log 2>&1")
-CRON_MONTHLY=$(envsubst < "$DEPLOY_DIR/configs/monthly-compression.cron.template" 2>/dev/null || echo "0 2 1 * * $DEPLOY_DIR/scripts/compress-old-data.sh >> $DEPLOY_DIR/logs/compression.log 2>&1")
 
-CURRENT_CRON=$(crontab -l 2>/dev/null || echo "")
-UPDATED=false
+# Always backup existing user crontab first
+CRON_BACKUP_DIR="$DEPLOY_DIR/backups/cron"
+mkdir -p "$CRON_BACKUP_DIR"
+crontab -l > "$CRON_BACKUP_DIR/crontab-$(date +%Y%m%d_%H%M%S).bak" 2>/dev/null || true
 
-if ! echo "$CURRENT_CRON" | grep -q "run-batch-validation"; then
-    CURRENT_CRON="$CURRENT_CRON"$'\n'"$CRON_HOURLY"
-    UPDATED=true
+export DEPLOY_DIR CRON_USER="$ACTUAL_USER"
+
+if [[ $EUID -eq 0 ]]; then
+    # Root: use /etc/cron.d/ (recommended - isolated, can't be overwritten by user crontab)
+    CRON_D_FILE="/etc/cron.d/aroivalidator"
+    if [[ -f "$DEPLOY_DIR/configs/aroivalidator.cron.d" ]]; then
+        envsubst '${DEPLOY_DIR} ${CRON_USER}' < "$DEPLOY_DIR/configs/aroivalidator.cron.d" > "$CRON_D_FILE"
+    else
+        cat > "$CRON_D_FILE" << EOF
+SHELL=/bin/bash
+PATH=/usr/local/bin:/usr/bin:/bin
+MAILTO=""
+5 * * * * ${CRON_USER} ${DEPLOY_DIR}/scripts/run-batch-validation.sh >> ${DEPLOY_DIR}/logs/cron.log 2>&1
+0 2 1 * * ${CRON_USER} ${DEPLOY_DIR}/scripts/compress-old-data.sh >> ${DEPLOY_DIR}/logs/compression.log 2>&1
+EOF
+    fi
+    chmod 644 "$CRON_D_FILE"
+    chown root:root "$CRON_D_FILE"
+    ok "Cron jobs installed to /etc/cron.d/aroivalidator (protected)"
+else
+    # Non-root: use user crontab (legacy method, with safety)
+    CRON_HOURLY=$(envsubst < "$DEPLOY_DIR/configs/aroivalidator.cron.template" 2>/dev/null || echo "5 * * * * $DEPLOY_DIR/scripts/run-batch-validation.sh >> $DEPLOY_DIR/logs/cron.log 2>&1")
+    CRON_MONTHLY=$(envsubst < "$DEPLOY_DIR/configs/monthly-compression.cron.template" 2>/dev/null || echo "0 2 1 * * $DEPLOY_DIR/scripts/compress-old-data.sh >> $DEPLOY_DIR/logs/compression.log 2>&1")
+    
+    CURRENT_CRON=$(crontab -l 2>/dev/null || echo "")
+    UPDATED=false
+    
+    if ! echo "$CURRENT_CRON" | grep -q "run-batch-validation"; then
+        CURRENT_CRON="$CURRENT_CRON"$'\n'"$CRON_HOURLY"
+        UPDATED=true
+    fi
+    if ! echo "$CURRENT_CRON" | grep -q "compress-old-data"; then
+        CURRENT_CRON="$CURRENT_CRON"$'\n'"$CRON_MONTHLY"
+        UPDATED=true
+    fi
+    
+    [[ "$UPDATED" == "true" ]] && echo "$CURRENT_CRON" | grep -v '^$' | crontab -
+    ok "Cron jobs (user crontab)"
+    warn "Consider running 'sudo ./scripts/cron-manage.sh install' for better protection"
 fi
-if ! echo "$CURRENT_CRON" | grep -q "compress-old-data"; then
-    CURRENT_CRON="$CURRENT_CRON"$'\n'"$CRON_MONTHLY"
-    UPDATED=true
-fi
-
-[[ "$UPDATED" == "true" ]] && echo "$CURRENT_CRON" | grep -v '^$' | crontab -
-ok "Cron jobs"
 
 # === Permissions ===
 chmod 755 "$DEPLOY_DIR"/scripts/*.sh 2>/dev/null || true
