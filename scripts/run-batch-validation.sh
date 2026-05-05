@@ -84,4 +84,9 @@ if [[ "$CLOUD_UPLOAD" == "true" ]]; then
     [[ $FAILED -gt 0 ]] && echo "⚠ $FAILED upload(s) failed" || echo "✓ All uploads done"
 fi
 
+# Prune old backups (non-fatal)
+if [[ -x "$SCRIPT_DIR/prune-backups.sh" ]]; then
+    "$SCRIPT_DIR/prune-backups.sh" >> "$LOG_DIR/prune.log" 2>&1 || true
+fi
+
 echo "=== Complete $(date) ==="
