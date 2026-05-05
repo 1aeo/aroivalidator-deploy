@@ -44,8 +44,15 @@ fi
 cd "$CODE_DIR"
 source venv/bin/activate
 
-echo "Running validation..."
-BATCH_LIMIT=0 PARALLEL=true MAX_WORKERS=20 python3 aroi_cli.py batch || { echo "Validation failed"; exit 1; }
+# CIISS ContactInfo spec versions to validate. Default 2,3 = every version this
+# build of aroivalidator understands (v2 RSA-fingerprint + v3 ed25519 family-ID).
+# Override via CIISS_VERSIONS in config.env (e.g. "3" to validate only v3 relays).
+: "${CIISS_VERSIONS:=2,3}"
+
+echo "Running validation (ciissversions: ${CIISS_VERSIONS})..."
+BATCH_LIMIT=0 PARALLEL=true MAX_WORKERS=20 python3 aroi_cli.py batch \
+    --ciiss-versions "$CIISS_VERSIONS" \
+    || { echo "Validation failed"; exit 1; }
 
 # Publish results
 SRC="$CODE_DIR/validation_results"
