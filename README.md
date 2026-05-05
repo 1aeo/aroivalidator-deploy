@@ -1,6 +1,8 @@
 # AROI Validator - Deployment
 
-Validates ~11,000 Tor relay operator IDs hourly.
+Validates ~11,000 Tor relay operator IDs hourly. Supports **CIISS ContactInfo
+specification versions 2** (RSA-fingerprint proofs) and **3** (ed25519
+family-ID proofs).
 
 **Live:** https://aroivalidator.pages.dev  
 **Code:** https://github.com/1aeo/AROIValidator
@@ -39,6 +41,11 @@ DO_SPACES_KEY=xxx          # Primary storage
 DO_SPACES_SECRET=xxx
 R2_ACCESS_KEY_ID=xxx       # Backup storage
 R2_SECRET_ACCESS_KEY=xxx
+```
+
+**Optional:**
+```bash
+CIISS_VERSIONS=2,3         # CIISS spec versions to validate (default: 2,3)
 ```
 
 **Deploy:**

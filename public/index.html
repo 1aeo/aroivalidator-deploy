@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="description" content="AROI Validator - Automated validation of Authenticated Relay Operator IDs">
+    <meta name="description" content="AROI Validator - Automated validation of Authenticated Relay Operator IDs (CIISS v2 + v3)">
     <!-- Security: Content Security Policy -->
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self';">
     <meta http-equiv="X-Content-Type-Options" content="nosniff">
@@ -195,6 +195,87 @@
             margin: 1rem 0;
         }
 
+        /* CIISS v2/v3 badges */
+        .badge {
+            display: inline-block;
+            padding: 0.1rem 0.5rem;
+            border-radius: 3px;
+            font-size: 0.75rem;
+            font-weight: bold;
+            line-height: 1.4;
+        }
+        .badge-v2 {
+            background: var(--aeo-green-dark);
+            color: var(--aeo-green);
+        }
+        .badge-v3 {
+            background: rgba(0, 200, 255, 0.15);
+            color: #66d9ff;
+            border: 1px solid #66d9ff;
+        }
+
+        /* Proof type breakdown table */
+        .proof-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 0.5rem;
+        }
+        .proof-table th,
+        .proof-table td {
+            padding: 0.6rem 0.8rem;
+            text-align: left;
+            border-bottom: 1px solid var(--aeo-dark-border);
+        }
+        .proof-table th {
+            color: var(--aeo-green);
+            font-size: 0.85rem;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        .proof-table td.num {
+            text-align: right;
+            font-variant-numeric: tabular-nums;
+        }
+        .proof-table td.proof-name {
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        }
+        .proof-table tr.no-proof-row td {
+            color: var(--aeo-text-dim);
+        }
+        .rate-bar {
+            display: inline-block;
+            width: 80px;
+            height: 8px;
+            background: rgba(255, 255, 255, 0.08);
+            border-radius: 4px;
+            overflow: hidden;
+            vertical-align: middle;
+            margin-left: 0.5rem;
+        }
+        .rate-bar > span {
+            display: block;
+            height: 100%;
+            background: var(--aeo-green);
+        }
+
+        .schema-pill {
+            display: inline-block;
+            padding: 2px 8px;
+            border: 1px solid var(--aeo-dark-border);
+            border-radius: 12px;
+            color: var(--aeo-text-dim);
+            font-size: 11px;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            margin-left: 0.5rem;
+            vertical-align: middle;
+        }
+
+        .stat-sub {
+            color: var(--aeo-text-dim);
+            font-size: 0.8rem;
+            margin-top: 0.25rem;
+        }
+
         .loading {
             text-align: center;
             color: var(--aeo-text-muted);
@@ -353,8 +434,9 @@
             <h1>🛡️ AROI Validator</h1>
             <p class="subtitle">Authenticated Relay Operator ID Verification</p>
             <p class="description">
-                Automated hourly validation of Authenticated Relay Operator IDs (AROIs) from the Tor network. 
-                Verifies relay operator identity proofs using DNS-RSA and URI-RSA cryptographic validation methods.
+                Automated hourly validation of Authenticated Relay Operator IDs (AROIs) from the Tor network.
+                Supports <strong>CIISS ContactInfo specification version 2</strong> (RSA-fingerprint proofs) and
+                <strong>version 3</strong> (ed25519 family-ID proofs).
             </p>
         </header>
 
@@ -375,6 +457,11 @@
                     <div class="stat-value" id="success-rate">--%</div>
                 </div>
                 <div class="stat-card">
+                    <div class="stat-label">CIISS Version Mix</div>
+                    <div class="stat-value" style="font-size: 1.4rem;" id="ciiss-mix">--</div>
+                    <div class="stat-sub" id="ciiss-mix-sub"></div>
+                </div>
+                <div class="stat-card">
                     <div class="stat-label">Last Updated</div>
                     <div class="stat-value" style="font-size: 1rem;" id="last-updated">--</div>
                 </div>
@@ -385,9 +472,31 @@
                 <a href="latest.json" class="button" download>⬇️ Download JSON</a>
             </p>
             
-            <p style="color: var(--aeo-text-dim); font-size: 0.85rem; margin-top: 1.5rem; text-align: center;" id="validation-timestamp">
-                Loading timestamp...
+            <p style="color: var(--aeo-text-dim); font-size: 0.85rem; margin-top: 1.5rem; text-align: center;">
+                <span id="validation-timestamp">Loading timestamp...</span>
+                <span class="schema-pill" id="schema-pill" style="display: none;"></span>
             </p>
+        </div>
+
+        <div class="section" id="proof-breakdown-section" style="display: none;">
+            <h2>🔍 Proof Type Breakdown</h2>
+            <p style="color: var(--aeo-text-muted); margin-bottom: 1rem;">
+                Validation results grouped by the proof type each relay declared in
+                its <code>ContactInfo</code> field.
+            </p>
+            <table class="proof-table">
+                <thead>
+                    <tr>
+                        <th>Proof Type</th>
+                        <th>CIISS</th>
+                        <th class="num">Total</th>
+                        <th class="num">Valid</th>
+                        <th class="num">Success rate</th>
+                    </tr>
+                </thead>
+                <tbody id="proof-breakdown-body"></tbody>
+            </table>
+            <p style="color: var(--aeo-text-dim); font-size: 0.85rem; margin-top: 1rem;" id="no-proof-footnote"></p>
         </div>
 
         <div class="section">
@@ -404,22 +513,42 @@
         <div class="section">
             <h2>ℹ️ About AROI Validation</h2>
             <p style="color: var(--aeo-text-muted);">
-                Authenticated Relay Operator IDs (AROIs) enable Tor relay operators to cryptographically 
-                prove ownership of their contact information. This validator automatically checks these 
+                Authenticated Relay Operator IDs (AROIs) enable Tor relay operators to cryptographically
+                prove ownership of their contact information. This validator automatically checks these
                 proofs to verify relay operator authenticity and build trust in the Tor network.
             </p>
-            <p style="color: var(--aeo-text-muted); margin-top: 1rem;">
-                <strong>Validation Methods:</strong>
+
+            <p style="color: var(--aeo-green); margin-top: 1.5rem; font-weight: bold;">
+                CIISS v2 — RSA-fingerprint proofs
             </p>
             <ul style="color: var(--aeo-text-muted); margin-left: 2rem; margin-top: 0.5rem;">
-                <li><strong>dns-rsa:</strong> DNSSEC-signed TXT record verification</li>
-                <li><strong>uri-rsa:</strong> URI-based RSA signature validation</li>
+                <li><strong>dns-rsa:</strong> per-relay DNS TXT record at <code>&lt;rsa-fp&gt;.&lt;domain&gt;</code></li>
+                <li><strong>uri-rsa:</strong> shared file at <code>/.well-known/tor-relay/rsa-fingerprint.txt</code></li>
+            </ul>
+
+            <p style="color: var(--aeo-green); margin-top: 1rem; font-weight: bold;">
+                CIISS v3 — ed25519 family-ID proofs
+            </p>
+            <ul style="color: var(--aeo-text-muted); margin-left: 2rem; margin-top: 0.5rem;">
+                <li><strong>dns-familyid-ed25519:</strong> shared TXT at
+                    <code>we-run-this-tor-ed25519-family-id.&lt;domain&gt;</code></li>
+                <li><strong>uri-familyid-ed25519:</strong> shared file at
+                    <code>/.well-known/tor-relay/ed25519-family-id.txt</code></li>
             </ul>
             <p style="color: var(--aeo-text-muted); margin-top: 1rem; font-size: 0.9rem;">
-                Learn more about the 
-                <a href="https://nusenu.github.io/tor-relay-operator-ids-trust-information/" target="_blank" rel="noopener noreferrer">
-                    AROI framework and trust methodology
+                v3 introduces "happy-family" keys: one shared ed25519 key proves
+                ownership across an operator's whole relay family, replacing v2's
+                per-relay RSA fingerprint listings.
+            </p>
+
+            <p style="color: var(--aeo-text-muted); margin-top: 1rem; font-size: 0.9rem;">
+                Learn more about the
+                <a href="https://nusenu.github.io/ContactInfo-Information-Sharing-Specification/" target="_blank" rel="noopener noreferrer">
+                    ContactInfo Information-Sharing Specification (CIISS)
                 </a>
+                and the
+                <a href="https://nusenu.github.io/tor-relay-operator-ids-trust-information/" target="_blank" rel="noopener noreferrer">
+                    AROI framework and trust methodology</a>.
             </p>
         </div>
     </div>
@@ -441,48 +570,184 @@
     </footer>
 
     <script>
+        // Pretty labels for known proof types. Keys are the underscored
+        // forms produced by the validator's calculate_statistics().
+        const PROOF_TYPE_META = {
+            'dns_rsa':              { label: 'dns-rsa',              version: '2' },
+            'uri_rsa':              { label: 'uri-rsa',              version: '2' },
+            'dns_familyid_ed25519': { label: 'dns-familyid-ed25519', version: '3' },
+            'uri_familyid_ed25519': { label: 'uri-familyid-ed25519', version: '3' },
+        };
+
+        function fmtNum(n) {
+            return (typeof n === 'number') ? n.toLocaleString('en-US') : '--';
+        }
+
         // Load and display latest results
         async function loadLatestResults() {
             try {
                 // Add cache-busting parameter to ensure fresh data
                 const response = await fetch('latest.json?t=' + Date.now());
                 const data = await response.json();
-                
-                // Update stats
-                document.getElementById('total-relays').textContent = 
-                    data.metadata?.total_relays || '--';
-                document.getElementById('valid-relays').textContent = 
-                    data.metadata?.valid_relays || '--';
-                
+
+                // Headline metadata stats
+                document.getElementById('total-relays').textContent =
+                    fmtNum(data.metadata?.total_relays);
+                document.getElementById('valid-relays').textContent =
+                    fmtNum(data.metadata?.valid_relays);
+
                 const successRate = data.metadata?.success_rate || 0;
-                document.getElementById('success-rate').textContent = 
+                document.getElementById('success-rate').textContent =
                     successRate.toFixed(1) + '%';
-                
+
+                // CIISS Version Mix card
+                renderCiissVersionMix(data);
+
+                // Schema pill
+                const schemaVer = data.metadata?.aroivalidator_schema_version;
+                const pill = document.getElementById('schema-pill');
+                if (schemaVer) {
+                    pill.textContent = 'schema v' + schemaVer;
+                    pill.style.display = 'inline-block';
+                } else {
+                    pill.style.display = 'none';
+                }
+
+                // Proof Type Breakdown section
+                renderProofBreakdown(data);
+
                 const timestamp = data.metadata?.timestamp;
                 if (timestamp) {
                     const date = new Date(timestamp);
-                    
+
                     // Show date and time on same line in Last Updated card
                     const shortDate = date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-                    const timeWithZone = date.toLocaleTimeString('en-US', { 
-                        hour: 'numeric', 
+                    const timeWithZone = date.toLocaleTimeString('en-US', {
+                        hour: 'numeric',
                         minute: '2-digit',
                         timeZoneName: 'short'
                     });
-                    document.getElementById('last-updated').textContent = 
+                    document.getElementById('last-updated').textContent =
                         shortDate + ' ' + timeWithZone;
-                    
+
                     // Update detailed timestamp at bottom of section
-                    document.getElementById('validation-timestamp').textContent = 
-                        'Validation completed: ' + date.toLocaleString('en-US', { 
-                            dateStyle: 'full', 
-                            timeStyle: 'long' 
+                    document.getElementById('validation-timestamp').textContent =
+                        'Validation completed: ' + date.toLocaleString('en-US', {
+                            dateStyle: 'full',
+                            timeStyle: 'long'
                         });
                 }
             } catch (error) {
                 console.error('Error loading latest results:', error);
-                document.getElementById('validation-timestamp').textContent = 
+                document.getElementById('validation-timestamp').textContent =
                     'Error loading latest results';
+            }
+        }
+
+        // Render the CIISS Version Mix stat card.
+        // Defensive against pre-v3-schema JSON: shows "—" when key absent.
+        function renderCiissVersionMix(data) {
+            const declared = data.statistics?.ciissversion_declared;
+            const valueEl = document.getElementById('ciiss-mix');
+            const subEl = document.getElementById('ciiss-mix-sub');
+            if (!declared || typeof declared !== 'object') {
+                valueEl.textContent = '—';
+                subEl.textContent = 'requires aroivalidator schema v2+';
+                return;
+            }
+            const v2 = Number.isFinite(declared['2']) ? declared['2'] : 0;
+            const v3 = Number.isFinite(declared['3']) ? declared['3'] : 0;
+            const noneCount = Number.isFinite(declared['none']) ? declared['none'] : 0;
+            valueEl.innerHTML =
+                'v2: <strong>' + fmtNum(v2) + '</strong>' +
+                ' <span style="color: var(--aeo-text-dim);">·</span> ' +
+                'v3: <strong>' + fmtNum(v3) + '</strong>';
+            subEl.textContent = noneCount > 0
+                ? fmtNum(noneCount) + ' relays declare none'
+                : '';
+        }
+
+        // Render the Proof Type Breakdown table from data.statistics.proof_types.
+        // Hides the whole section gracefully if pre-v3 schema (no proof_types).
+        function renderProofBreakdown(data) {
+            const section = document.getElementById('proof-breakdown-section');
+            const tbody = document.getElementById('proof-breakdown-body');
+            const footnote = document.getElementById('no-proof-footnote');
+            const proofTypes = data.statistics?.proof_types;
+            if (!proofTypes || typeof proofTypes !== 'object') {
+                section.style.display = 'none';
+                return;
+            }
+            section.style.display = '';
+            tbody.innerHTML = '';
+
+            // Render rows in a stable order: v2 keys first, then v3, then any unknown.
+            const knownOrder = [
+                'dns_rsa', 'uri_rsa',
+                'dns_familyid_ed25519', 'uri_familyid_ed25519'
+            ];
+            const seen = new Set();
+            const rows = [];
+
+            for (const key of knownOrder) {
+                if (proofTypes[key]) {
+                    rows.push([key, proofTypes[key]]);
+                    seen.add(key);
+                }
+            }
+            for (const [key, value] of Object.entries(proofTypes)) {
+                if (key === 'no_proof' || seen.has(key)) continue;
+                rows.push([key, value]);
+            }
+
+            for (const [key, info] of rows) {
+                const meta = PROOF_TYPE_META[key] || { label: key.replace(/_/g, '-'), version: '?' };
+                const total = Number(info.total) || 0;
+                const valid = Number(info.valid) || 0;
+                const rate = (typeof info.success_rate === 'number')
+                    ? info.success_rate
+                    : (total > 0 ? (valid / total * 100) : 0);
+                const rateClamped = Math.max(0, Math.min(100, rate));
+                const tr = document.createElement('tr');
+                tr.innerHTML =
+                    '<td class="proof-name">' + escapeHtml(meta.label) + '</td>' +
+                    '<td><span class="badge badge-v' + escapeHtml(meta.version) + '">v' +
+                        escapeHtml(meta.version) + '</span></td>' +
+                    '<td class="num">' + fmtNum(total) + '</td>' +
+                    '<td class="num">' + fmtNum(valid) + '</td>' +
+                    '<td class="num">' + rate.toFixed(1) + '%' +
+                        '<span class="rate-bar"><span style="width: ' + rateClamped + '%"></span></span>' +
+                    '</td>';
+                tbody.appendChild(tr);
+            }
+
+            // No-proof row + footnote
+            const noProof = proofTypes.no_proof;
+            if (noProof && typeof noProof === 'object') {
+                const total = Number(noProof.total) || 0;
+                const tr = document.createElement('tr');
+                tr.className = 'no-proof-row';
+                tr.innerHTML =
+                    '<td class="proof-name">no proof</td>' +
+                    '<td>—</td>' +
+                    '<td class="num">' + fmtNum(total) + '</td>' +
+                    '<td class="num">—</td>' +
+                    '<td class="num">n/a</td>';
+                tbody.appendChild(tr);
+
+                const noAroi = Number(noProof.no_aroi);
+                const v3NoUrl = Number(noProof.ciissversion3_no_url);
+                if (Number.isFinite(noAroi) || Number.isFinite(v3NoUrl)) {
+                    const v3Compliant = Number.isFinite(v3NoUrl) ? v3NoUrl : 0;
+                    footnote.textContent =
+                        'Of ' + fmtNum(total) + ' relays with no proof, ' +
+                        fmtNum(v3Compliant) + ' declared ciissversion:3 with informational ' +
+                        'fields only (spec-compliant — no domain claim to verify).';
+                } else {
+                    footnote.textContent = '';
+                }
+            } else {
+                footnote.textContent = '';
             }
         }
 
