@@ -69,6 +69,7 @@ log "Generating wrangler.toml..."
 STATIC_DIR="$DEPLOY_DIR/pages-static"
 mkdir -p "$STATIC_DIR"
 cp -f "$DEPLOY_DIR/public/index.html" "$STATIC_DIR/"
+cp -f "$DEPLOY_DIR/public/sitemap.xml" "$STATIC_DIR/"
 
 log "Project: $PAGES_PROJECT_NAME | Storage: $STORAGE_ORDER"
 log "DO: ${DO_SPACES_URL:-disabled} | R2: ${R2_BUCKET:-disabled}"
