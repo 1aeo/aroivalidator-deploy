@@ -18,6 +18,7 @@ case "${1:-}" in
     *) FORCE=false; init_upload "${1:-}" ;;
 esac
 
+lock_upload "r2"  # exits $UPLOAD_SKIPPED if the previous R2 upload is still running
 check_rclone || exit 1
 [[ -d "$SOURCE_DIR" ]] || { log_error "Source not found: $SOURCE_DIR"; exit 1; }
 ensure_r2_remote || exit 1

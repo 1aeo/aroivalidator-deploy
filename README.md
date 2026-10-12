@@ -95,6 +95,55 @@ tail -f logs/cron.log
 
 ---
 
+## Locks & Logs
+
+The hourly run holds `logs/validation.lock` only for the code update, validation
+and publishing to `public/` (about a minute). Uploads start after it is released,
+each under its own provider lock, so a slow upload (e.g. the daily backups in the
+first upload of the day) no longer makes the next hour skip validation or the
+code update.
+
+| Lock (`logs/`) | Held by | When busy |
+|----------------|---------|-----------|
+| `validation.lock` | update + validation + publish | run exits `Already running (... pid N, since T)` |
+| `public.lock` | publish step, `compress-old-data.sh`, upload snapshot (< 1 s) | waits (publish and snapshot 15 min, compress 1 h) |
+| `upload-do.lock`, `upload-r2.lock` | `upload-do.sh`, `upload-r2.sh` incl. backups (also manual runs) | upload skipped; the next run syncs everything |
+| `prune.lock` | `prune-backups.sh` | prune skipped |
+
+Lock files hold the holder's `pid start-time` and are never deleted.
+
+Nothing in `public/` is written in place: files reach it by rename from `tmp/`.
+Each upload syncs a hard-link snapshot of `public/` (`tmp/upload-do.snap/`,
+`tmp/upload-r2.snap/`) taken under `public.lock`, so it always uploads one
+complete publish, and a publish during a long upload cannot change a file rclone
+is reading (which made rclone fail it as `corrupted on transfer` and skip
+deletions). Newer results go up with the next upload. The snapshot is removed
+when rclone finishes; one left by a killed upload is removed by the next upload
+to the same provider. If a snapshot cannot be removed, the upload logs a
+`WARNING` and syncs `public/` directly until it is gone.
+
+Temp files an interrupted publish leaves in `tmp/` are removed by the next
+publish or compress once it holds `public.lock` (logged as `Removed N leftover
+temp file(s) from tmp/`); snapshot directories are left alone.
+
+Per run, `cron.log` shows:
+
+```
+HEAD is now at 6e070ff ...                     # code update succeeded
+WARNING: code update failed at 'git fetch origin main' (exit 128): ... - running existing checkout
+Code: 6e070ff <subject> (origin/main 6e070ff)  # code that ran; full SHA is passed to the validator as AROIVALIDATOR_COMMIT
+Note: validating while DO upload (pid 889905, since 2026-10-12 00:00:31) is still running
+Validation + publish done in 41s, validation lock released
+↷ skipping DO upload: previous still running (pid 889905, since 2026-10-12 00:00:31) [batch 01:00:01]
+✓ R2 (95s) [batch 01:00:01]
+=== Complete Mon Oct 12 01:02:37 AM PDT 2026 [batch 01:00:01] ===
+```
+
+Lines after the lock is released are tagged `[batch HH:MM:SS]` (the run's start
+time), because a run waiting on a long upload can finish after the next run starts.
+
+---
+
 ## Structure
 
 ```

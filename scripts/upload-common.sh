@@ -23,6 +23,7 @@ init_upload() {
     SOURCE_DIR="${1:-${OUTPUT_DIR:-$DEPLOY_DIR/public}}"
     BACKUP_DIR="${BACKUP_DIR:-$DEPLOY_DIR/backups}"
     LOG_DIR="$DEPLOY_DIR/logs"
+    STAGE_DIR="$DEPLOY_DIR/tmp"  # same filesystem as public/: upload snapshots are hard links
     RCLONE="${RCLONE_PATH:-$(command -v rclone 2>/dev/null || echo "$HOME/bin/rclone")}"
     TODAY=$(date '+%Y-%m-%d')
     TIMESTAMP=$(date '+%Y-%m-%d_%H%M%S')
@@ -39,6 +40,70 @@ init_upload() {
         "--fast-list" "--stats=10s" "--stats-one-line" "--log-level=NOTICE"
         "--retries=5" "--retries-sleep=2s" "--low-level-retries=10"
     )
+}
+
+# Per-provider lock, held until this script and its rclone children exit, so a long
+# backup/sync never overlaps the next upload to the same provider. A busy provider
+# is skipped rather than waited for: rclone sync is idempotent, the next run catches up.
+lock_upload() {
+    local lock="$LOG_DIR/upload-$1.lock"
+    exec 8>>"$lock"
+    if ! flock -n 8; then
+        log "Skipping upload: previous still running ($(lock_holder "$lock"))"
+        exit "$UPLOAD_SKIPPED"
+    fi
+    note_lock_holder "$lock"
+    # This provider's snapshot (see snapshot_source). One left by a killed upload is
+    # removed here: holding the lock means no rclone of that upload still reads it.
+    UPLOAD_SNAP="$STAGE_DIR/upload-$1.snap"
+    remove_snapshot "$UPLOAD_SNAP" || true
+}
+
+# Remove an upload snapshot. cp -a gives its directories the modes of those in public/,
+# so a read-only directory there (e.g. archives/ at 555) would make rm -rf fail, and
+# with it every later upload to this provider. The directories are the snapshot's own:
+# make them writable first. Never chmod its files: they are hard links to the published
+# files and share their modes. Warns and returns 1 if it still cannot be removed.
+remove_snapshot() {
+    local snap=$1 err
+    [[ -e "$snap" || -L "$snap" ]] || return 0
+    find "$snap" -type d ! -perm -u=rwx -exec chmod u+rwx {} \; 2>/dev/null || true
+    err=$(rm -rf "$snap" 2>&1) && return 0
+    log "WARNING: cannot remove snapshot $snap (${err%%$'\n'*})"
+    return 1
+}
+
+# Take a hard-link snapshot of SOURCE_DIR under public.lock (so never mid-publish) and
+# set SYNC_SOURCE to it. Publishes and compress-old-data.sh only rename new files into
+# public/ and never write in place, so the snapshot's files cannot change while rclone
+# reads them. Syncing public/ itself, a publish during a long sync makes rclone fail
+# the file ("corrupted on transfer"), skip deletions and retry the whole sync.
+# Falls back to SOURCE_DIR (with a warning) if the snapshot cannot be made.
+snapshot_source() {
+    local lock="$LOG_DIR/public.lock" err
+    SYNC_SOURCE="$SOURCE_DIR"
+    mkdir -p "$STAGE_DIR"
+    # lock_upload could not remove the last snapshot (and warned). Copying into it would
+    # add back files since deleted from public/, and the sync would upload them again.
+    if [[ -e "$UPLOAD_SNAP" || -L "$UPLOAD_SNAP" ]]; then
+        log "WARNING: $UPLOAD_SNAP still present - syncing $SOURCE_DIR directly"
+        UPLOAD_SNAP=""
+        return 0
+    fi
+    exec 7>>"$lock"
+    if ! flock -w "$PUBLIC_LOCK_WAIT" 7; then
+        log_error "Not uploading: public.lock still held after ${PUBLIC_LOCK_WAIT}s ($(lock_holder "$lock"))"
+        exec 7>&-
+        return 1
+    fi
+    note_lock_holder "$lock"
+    if err=$(cp -al "$SOURCE_DIR/." "$UPLOAD_SNAP" 2>&1); then  # "/.": follow a symlinked SOURCE_DIR
+        SYNC_SOURCE="$UPLOAD_SNAP"
+    else
+        log "WARNING: snapshot failed (${err%%$'\n'*}) - syncing $SOURCE_DIR directly"
+        remove_snapshot "$UPLOAD_SNAP" || true
+    fi
+    exec 7>&-
 }
 
 check_rclone() {
@@ -76,9 +141,21 @@ ensure_do_remote() {
         acl=public-read no_check_bucket=true
 }
 
-# Backup if not done today (returns 0 if backup made, 1 if skipped)
+# Print the first 10 and last 5 lines of rclone's output. Reads all of it: with head -n,
+# rclone was killed by SIGPIPE mid-transfer at its next log line once head had exited.
+rclone_summary() {
+    awk -v h=10 -v t=5 '
+        NR <= h { print; fflush(); next }
+        { last[NR % t] = $0 }
+        END {
+            if (NR > h + t) print "... (" (NR - h - t) " line(s) omitted)"
+            for (i = (NR > h + t ? NR - t + 1 : h + 1); i <= NR; i++) print last[i % t]
+        }'
+}
+
+# Backup if not done today (returns 0 if backup made, 1 if skipped or failed)
 maybe_backup() {
-    local bucket="$1" marker="$2" type="$3" force="${4:-false}"
+    local bucket="$1" marker="$2" type="$3" force="${4:-false}" rc=0
     [[ "$force" == "true" ]] || { [[ -f "$marker" && "$(cat "$marker")" == "$TODAY" ]] && return 1; }
     
     local target
@@ -86,21 +163,32 @@ maybe_backup() {
         target="$BACKUP_DIR/backup-$TIMESTAMP"
         log "Local backup → $target"
         mkdir -p "$target"
-        "$RCLONE" sync "$bucket" "$target" --exclude "_backups/**" "${RCLONE_OPTS_ARRAY[@]}" 2>&1 | head -5
     else
         target="$bucket/_backups/$TIMESTAMP"
         log "Remote backup → $target"
-        "$RCLONE" sync "$bucket" "$target" --exclude "_backups/**" "${RCLONE_OPTS_ARRAY[@]}" 2>&1 | head -5
     fi
-    echo "$TODAY" > "$marker"
+    "$RCLONE" sync "$bucket" "$target" --exclude "_backups/**" "${RCLONE_OPTS_ARRAY[@]}" 2>&1 | rclone_summary || rc=${PIPESTATUS[0]}
+    echo "$TODAY" > "$marker"  # attempted today, as before: a failed backup is not retried hourly
+    if [[ $rc -ne 0 ]]; then
+        log_error "${type^} backup to $target failed (rclone exit $rc)"
+        return 1
+    fi
     log_success "${type^} backup done"
 }
 
 # Main upload function
 do_upload() {
-    local bucket="$1"
-    log "Syncing $SOURCE_DIR → $bucket"
-    "$RCLONE" sync "$SOURCE_DIR" "$bucket" --exclude "_backups/**" --exclude "index.html" "${RCLONE_OPTS_ARRAY[@]}" 2>&1 | head -10
+    local bucket="$1" rc=0
+    snapshot_source || return 1
+    log "Syncing $SYNC_SOURCE → $bucket"
+    "$RCLONE" sync "$SYNC_SOURCE" "$bucket" --exclude "_backups/**" --exclude "index.html" "${RCLONE_OPTS_ARRAY[@]}" 2>&1 | rclone_summary || rc=${PIPESTATUS[0]}
+    # Not an EXIT trap: that would also run if this script is killed while its rclone
+    # keeps reading the snapshot. A leftover is removed by the next lock_upload.
+    remove_snapshot "$UPLOAD_SNAP" || true
+    if [[ $rc -ne 0 ]]; then
+        log_error "Sync to $bucket failed (rclone exit $rc)"
+        return "$rc"
+    fi
     log_success "Upload complete"
 }
 
