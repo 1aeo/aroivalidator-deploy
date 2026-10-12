@@ -106,13 +106,20 @@ code update.
 | Lock (`logs/`) | Held by | When busy |
 |----------------|---------|-----------|
 | `validation.lock` | update + validation + publish | run exits `Already running (... pid N, since T)` |
-| `public.lock` | publish step, `compress-old-data.sh` | waits (publish 15 min, compress 1 h) |
+| `public.lock` | publish step, `compress-old-data.sh`, upload snapshot (< 1 s) | waits (publish and snapshot 15 min, compress 1 h) |
 | `upload-do.lock`, `upload-r2.lock` | `upload-do.sh`, `upload-r2.sh` incl. backups (also manual runs) | upload skipped; the next run syncs everything |
 | `prune.lock` | `prune-backups.sh` | prune skipped |
 
-Lock files hold the holder's `pid start-time` and are never deleted. Files reach
-`public/` by rename from `tmp/`, so an upload reading `public/` never sees a
-partial file.
+Lock files hold the holder's `pid start-time` and are never deleted.
+
+Nothing in `public/` is written in place: files reach it by rename from `tmp/`.
+Each upload syncs a hard-link snapshot of `public/` (`tmp/upload-do.snap/`,
+`tmp/upload-r2.snap/`) taken under `public.lock`, so it always uploads one
+complete publish, and a publish during a long upload cannot change a file rclone
+is reading (which made rclone fail it as `corrupted on transfer` and skip
+deletions). Newer results go up with the next upload. The snapshot is removed
+when rclone finishes; one left by a killed upload is removed by the next upload
+to the same provider.
 
 Per run, `cron.log` shows:
 

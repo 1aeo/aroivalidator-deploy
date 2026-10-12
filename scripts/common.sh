@@ -63,7 +63,7 @@ load_config() {
 # shellcheck disable=SC2034  # used by upload-common.sh and run-batch-validation.sh
 UPLOAD_SKIPPED=75
 
-# How long the publish step waits for public.lock
+# How long the publish step and upload snapshots wait for public.lock
 # shellcheck disable=SC2034  # used by upload-common.sh and run-batch-validation.sh
 PUBLIC_LOCK_WAIT=900
 

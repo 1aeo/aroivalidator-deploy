@@ -23,6 +23,7 @@ init_upload() {
     SOURCE_DIR="${1:-${OUTPUT_DIR:-$DEPLOY_DIR/public}}"
     BACKUP_DIR="${BACKUP_DIR:-$DEPLOY_DIR/backups}"
     LOG_DIR="$DEPLOY_DIR/logs"
+    STAGE_DIR="$DEPLOY_DIR/tmp"  # same filesystem as public/: upload snapshots are hard links
     RCLONE="${RCLONE_PATH:-$(command -v rclone 2>/dev/null || echo "$HOME/bin/rclone")}"
     TODAY=$(date '+%Y-%m-%d')
     TIMESTAMP=$(date '+%Y-%m-%d_%H%M%S')
@@ -52,6 +53,37 @@ lock_upload() {
         exit "$UPLOAD_SKIPPED"
     fi
     note_lock_holder "$lock"
+    # This provider's snapshot (see snapshot_source). One left by a killed upload is
+    # removed here: holding the lock means no rclone of that upload still reads it.
+    UPLOAD_SNAP="$STAGE_DIR/upload-$1.snap"
+    rm -rf "$UPLOAD_SNAP"
+}
+
+# Take a hard-link snapshot of SOURCE_DIR under public.lock (so never mid-publish) and
+# set SYNC_SOURCE to it. Publishes and compress-old-data.sh only rename new files into
+# public/ and never write in place, so the snapshot's files cannot change while rclone
+# reads them. Syncing public/ itself, a publish during a long sync makes rclone fail
+# the file ("corrupted on transfer"), skip deletions and retry the whole sync.
+# Falls back to SOURCE_DIR (with a warning) if the snapshot cannot be made.
+snapshot_source() {
+    local lock="$LOG_DIR/public.lock" err
+    SYNC_SOURCE="$SOURCE_DIR"
+    mkdir -p "$STAGE_DIR"
+    rm -rf "$UPLOAD_SNAP"
+    exec 7>>"$lock"
+    if ! flock -w "$PUBLIC_LOCK_WAIT" 7; then
+        log_error "Not uploading: public.lock still held after ${PUBLIC_LOCK_WAIT}s ($(lock_holder "$lock"))"
+        exec 7>&-
+        return 1
+    fi
+    note_lock_holder "$lock"
+    if err=$(cp -al "$SOURCE_DIR/." "$UPLOAD_SNAP" 2>&1); then  # "/.": follow a symlinked SOURCE_DIR
+        SYNC_SOURCE="$UPLOAD_SNAP"
+    else
+        log "WARNING: snapshot failed (${err%%$'\n'*}) - syncing $SOURCE_DIR directly"
+        rm -rf "$UPLOAD_SNAP"
+    fi
+    exec 7>&-
 }
 
 check_rclone() {
@@ -111,9 +143,14 @@ maybe_backup() {
 
 # Main upload function
 do_upload() {
-    local bucket="$1"
-    log "Syncing $SOURCE_DIR → $bucket"
-    "$RCLONE" sync "$SOURCE_DIR" "$bucket" --exclude "_backups/**" --exclude "index.html" "${RCLONE_OPTS_ARRAY[@]}" 2>&1 | head -10
+    local bucket="$1" rc=0
+    snapshot_source || return 1
+    log "Syncing $SYNC_SOURCE → $bucket"
+    "$RCLONE" sync "$SYNC_SOURCE" "$bucket" --exclude "_backups/**" --exclude "index.html" "${RCLONE_OPTS_ARRAY[@]}" 2>&1 | head -10 || rc=$?
+    # Not an EXIT trap: that would also run if this script is killed while its rclone
+    # keeps reading the snapshot. A leftover is removed by the next lock_upload.
+    rm -rf "$UPLOAD_SNAP"
+    [[ $rc -eq 0 ]] || return "$rc"
     log_success "Upload complete"
 }
 

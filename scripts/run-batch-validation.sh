@@ -107,8 +107,8 @@ BATCH_LIMIT=0 PARALLEL=true MAX_WORKERS=20 python3 aroi_cli.py batch \
     --ciiss-versions "$CIISS_VERSIONS" \
     || { echo "Validation failed"; exit 1; }
 
-# Copy into public/ via STAGE_DIR + rename, so an upload still reading public/
-# (e.g. a long DO sync from an earlier hour) never sees a partial file
+# Copy into public/ via STAGE_DIR + rename: nothing in public/ is written in place,
+# so an upload's hard-link snapshot of it (see upload-common.sh) never changes
 publish_file() { cp "$1" "$STAGE_DIR/$2" && mv -f "$STAGE_DIR/$2" "$WEB_DIR/$2"; }
 
 # Publish results
