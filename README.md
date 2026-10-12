@@ -119,7 +119,8 @@ complete publish, and a publish during a long upload cannot change a file rclone
 is reading (which made rclone fail it as `corrupted on transfer` and skip
 deletions). Newer results go up with the next upload. The snapshot is removed
 when rclone finishes; one left by a killed upload is removed by the next upload
-to the same provider.
+to the same provider. If a snapshot cannot be removed, the upload logs a
+`WARNING` and syncs `public/` directly until it is gone.
 
 Temp files an interrupted publish leaves in `tmp/` are removed by the next
 publish or compress once it holds `public.lock` (logged as `Removed N leftover

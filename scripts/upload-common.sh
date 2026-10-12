@@ -56,7 +56,21 @@ lock_upload() {
     # This provider's snapshot (see snapshot_source). One left by a killed upload is
     # removed here: holding the lock means no rclone of that upload still reads it.
     UPLOAD_SNAP="$STAGE_DIR/upload-$1.snap"
-    rm -rf "$UPLOAD_SNAP"
+    remove_snapshot "$UPLOAD_SNAP" || true
+}
+
+# Remove an upload snapshot. cp -a gives its directories the modes of those in public/,
+# so a read-only directory there (e.g. archives/ at 555) would make rm -rf fail, and
+# with it every later upload to this provider. The directories are the snapshot's own:
+# make them writable first. Never chmod its files: they are hard links to the published
+# files and share their modes. Warns and returns 1 if it still cannot be removed.
+remove_snapshot() {
+    local snap=$1 err
+    [[ -e "$snap" || -L "$snap" ]] || return 0
+    find "$snap" -type d ! -perm -u=rwx -exec chmod u+rwx {} \; 2>/dev/null || true
+    err=$(rm -rf "$snap" 2>&1) && return 0
+    log "WARNING: cannot remove snapshot $snap (${err%%$'\n'*})"
+    return 1
 }
 
 # Take a hard-link snapshot of SOURCE_DIR under public.lock (so never mid-publish) and
@@ -69,7 +83,13 @@ snapshot_source() {
     local lock="$LOG_DIR/public.lock" err
     SYNC_SOURCE="$SOURCE_DIR"
     mkdir -p "$STAGE_DIR"
-    rm -rf "$UPLOAD_SNAP"
+    # lock_upload could not remove the last snapshot (and warned). Copying into it would
+    # add back files since deleted from public/, and the sync would upload them again.
+    if [[ -e "$UPLOAD_SNAP" || -L "$UPLOAD_SNAP" ]]; then
+        log "WARNING: $UPLOAD_SNAP still present - syncing $SOURCE_DIR directly"
+        UPLOAD_SNAP=""
+        return 0
+    fi
     exec 7>>"$lock"
     if ! flock -w "$PUBLIC_LOCK_WAIT" 7; then
         log_error "Not uploading: public.lock still held after ${PUBLIC_LOCK_WAIT}s ($(lock_holder "$lock"))"
@@ -81,7 +101,7 @@ snapshot_source() {
         SYNC_SOURCE="$UPLOAD_SNAP"
     else
         log "WARNING: snapshot failed (${err%%$'\n'*}) - syncing $SOURCE_DIR directly"
-        rm -rf "$UPLOAD_SNAP"
+        remove_snapshot "$UPLOAD_SNAP" || true
     fi
     exec 7>&-
 }
@@ -149,7 +169,7 @@ do_upload() {
     "$RCLONE" sync "$SYNC_SOURCE" "$bucket" --exclude "_backups/**" --exclude "index.html" "${RCLONE_OPTS_ARRAY[@]}" 2>&1 | head -10 || rc=$?
     # Not an EXIT trap: that would also run if this script is killed while its rclone
     # keeps reading the snapshot. A leftover is removed by the next lock_upload.
-    rm -rf "$UPLOAD_SNAP"
+    remove_snapshot "$UPLOAD_SNAP" || true
     [[ $rc -eq 0 ]] || return "$rc"
     log_success "Upload complete"
 }
