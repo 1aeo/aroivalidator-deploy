@@ -88,6 +88,15 @@ lock_holder() {
     echo "pid ${pid:-?}${state}, since ${since:-?}"
 }
 
+# Remove files an interrupted publish or compress left in tmp/ (rsync --temp-dir
+# "<name>.XXXXXX", staged latest.json/files.json/archives). Call with public.lock held.
+# Regular files directly in tmp/ only: upload snapshots (tmp/upload-*.snap/) are directories.
+clean_stage_dir() {
+    local n
+    n=$(find "$1" -maxdepth 1 -type f -print -delete 2>/dev/null | wc -l) || n=0
+    [[ $n -eq 0 ]] || echo "Removed $((n)) leftover temp file(s) from ${1##*/}/ (interrupted publish)"
+}
+
 # === Logging Functions ===
 _log_ts() { date '+%H:%M:%S'; }
 

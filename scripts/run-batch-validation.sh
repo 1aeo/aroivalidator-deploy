@@ -119,6 +119,7 @@ if [[ -d "$SRC" ]]; then
     exec 7>>"$PUBLIC_LOCK"
     if flock -w "$PUBLIC_LOCK_WAIT" 7; then
         note_lock_holder "$PUBLIC_LOCK"
+        clean_stage_dir "$STAGE_DIR"
         rc=0
         out=$(rsync -a --temp-dir="$STAGE_DIR" --include='*.json' --exclude='*' "$SRC/" "$WEB_DIR/" 2>&1) || rc=$?
         if [[ $rc -ne 0 ]]; then

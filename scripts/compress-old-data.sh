@@ -38,6 +38,7 @@ if ! flock -w "$COMPRESS_LOCK_WAIT" 7; then
     exit 1
 fi
 note_lock_holder "$LOG_DIR/public.lock"
+clean_stage_dir "$STAGE_DIR"
 
 # === COMPRESS VALIDATION FILES (180+ days old) ===
 echo "Checking for validation files 180+ days old..."

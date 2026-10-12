@@ -121,6 +121,10 @@ deletions). Newer results go up with the next upload. The snapshot is removed
 when rclone finishes; one left by a killed upload is removed by the next upload
 to the same provider.
 
+Temp files an interrupted publish leaves in `tmp/` are removed by the next
+publish or compress once it holds `public.lock` (logged as `Removed N leftover
+temp file(s) from tmp/`); snapshot directories are left alone.
+
 Per run, `cron.log` shows:
 
 ```
