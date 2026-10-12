@@ -141,9 +141,21 @@ ensure_do_remote() {
         acl=public-read no_check_bucket=true
 }
 
-# Backup if not done today (returns 0 if backup made, 1 if skipped)
+# Print the first 10 and last 5 lines of rclone's output. Reads all of it: with head -n,
+# rclone was killed by SIGPIPE mid-transfer at its next log line once head had exited.
+rclone_summary() {
+    awk -v h=10 -v t=5 '
+        NR <= h { print; fflush(); next }
+        { last[NR % t] = $0 }
+        END {
+            if (NR > h + t) print "... (" (NR - h - t) " line(s) omitted)"
+            for (i = (NR > h + t ? NR - t + 1 : h + 1); i <= NR; i++) print last[i % t]
+        }'
+}
+
+# Backup if not done today (returns 0 if backup made, 1 if skipped or failed)
 maybe_backup() {
-    local bucket="$1" marker="$2" type="$3" force="${4:-false}"
+    local bucket="$1" marker="$2" type="$3" force="${4:-false}" rc=0
     [[ "$force" == "true" ]] || { [[ -f "$marker" && "$(cat "$marker")" == "$TODAY" ]] && return 1; }
     
     local target
@@ -151,13 +163,16 @@ maybe_backup() {
         target="$BACKUP_DIR/backup-$TIMESTAMP"
         log "Local backup → $target"
         mkdir -p "$target"
-        "$RCLONE" sync "$bucket" "$target" --exclude "_backups/**" "${RCLONE_OPTS_ARRAY[@]}" 2>&1 | head -5
     else
         target="$bucket/_backups/$TIMESTAMP"
         log "Remote backup → $target"
-        "$RCLONE" sync "$bucket" "$target" --exclude "_backups/**" "${RCLONE_OPTS_ARRAY[@]}" 2>&1 | head -5
     fi
-    echo "$TODAY" > "$marker"
+    "$RCLONE" sync "$bucket" "$target" --exclude "_backups/**" "${RCLONE_OPTS_ARRAY[@]}" 2>&1 | rclone_summary || rc=${PIPESTATUS[0]}
+    echo "$TODAY" > "$marker"  # attempted today, as before: a failed backup is not retried hourly
+    if [[ $rc -ne 0 ]]; then
+        log_error "${type^} backup to $target failed (rclone exit $rc)"
+        return 1
+    fi
     log_success "${type^} backup done"
 }
 
@@ -166,11 +181,14 @@ do_upload() {
     local bucket="$1" rc=0
     snapshot_source || return 1
     log "Syncing $SYNC_SOURCE → $bucket"
-    "$RCLONE" sync "$SYNC_SOURCE" "$bucket" --exclude "_backups/**" --exclude "index.html" "${RCLONE_OPTS_ARRAY[@]}" 2>&1 | head -10 || rc=$?
+    "$RCLONE" sync "$SYNC_SOURCE" "$bucket" --exclude "_backups/**" --exclude "index.html" "${RCLONE_OPTS_ARRAY[@]}" 2>&1 | rclone_summary || rc=${PIPESTATUS[0]}
     # Not an EXIT trap: that would also run if this script is killed while its rclone
     # keeps reading the snapshot. A leftover is removed by the next lock_upload.
     remove_snapshot "$UPLOAD_SNAP" || true
-    [[ $rc -eq 0 ]] || return "$rc"
+    if [[ $rc -ne 0 ]]; then
+        log_error "Sync to $bucket failed (rclone exit $rc)"
+        return "$rc"
+    fi
     log_success "Upload complete"
 }
 
