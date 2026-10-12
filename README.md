@@ -95,6 +95,42 @@ tail -f logs/cron.log
 
 ---
 
+## Locks & Logs
+
+The hourly run holds `logs/validation.lock` only for the code update, validation
+and publishing to `public/` (about a minute). Uploads start after it is released,
+each under its own provider lock, so a slow upload (e.g. the daily backups in the
+first upload of the day) no longer makes the next hour skip validation or the
+code update.
+
+| Lock (`logs/`) | Held by | When busy |
+|----------------|---------|-----------|
+| `validation.lock` | update + validation + publish | run exits `Already running (... pid N, since T)` |
+| `public.lock` | publish step, `compress-old-data.sh` | waits (publish 15 min, compress 1 h) |
+| `upload-do.lock`, `upload-r2.lock` | `upload-do.sh`, `upload-r2.sh` incl. backups (also manual runs) | upload skipped; the next run syncs everything |
+| `prune.lock` | `prune-backups.sh` | prune skipped |
+
+Lock files hold the holder's `pid start-time` and are never deleted. Files reach
+`public/` by rename from `tmp/`, so an upload reading `public/` never sees a
+partial file.
+
+Per run, `cron.log` shows:
+
+```
+HEAD is now at 6e070ff ...                     # code update succeeded
+WARNING: code update failed at 'git fetch origin main' (exit 128): ... - running existing checkout
+Code: 6e070ff <subject> (origin/main 6e070ff)  # code that ran; full SHA is passed to the validator as AROIVALIDATOR_COMMIT
+Validation + publish done in 41s, validation lock released
+↷ skipping DO upload: previous still running (pid 889905, since 2026-10-12 00:00:31) [batch 01:00:01]
+✓ R2 (95s) [batch 01:00:01]
+=== Complete Mon Oct 12 01:02:37 AM PDT 2026 [batch 01:00:01] ===
+```
+
+Lines after the lock is released are tagged `[batch HH:MM:SS]` (the run's start
+time), because a run waiting on a long upload can finish after the next run starts.
+
+---
+
 ## Structure
 
 ```

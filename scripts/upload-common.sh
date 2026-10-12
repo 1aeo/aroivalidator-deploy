@@ -41,6 +41,19 @@ init_upload() {
     )
 }
 
+# Per-provider lock, held until this script and its rclone children exit, so a long
+# backup/sync never overlaps the next upload to the same provider. A busy provider
+# is skipped rather than waited for: rclone sync is idempotent, the next run catches up.
+lock_upload() {
+    local lock="$LOG_DIR/upload-$1.lock"
+    exec 8>>"$lock"
+    if ! flock -n 8; then
+        log "Skipping upload: previous still running ($(lock_holder "$lock"))"
+        exit "$UPLOAD_SKIPPED"
+    fi
+    note_lock_holder "$lock"
+}
+
 check_rclone() {
     [[ -x "$RCLONE" ]] || { log_error "rclone not found at $RCLONE"; return 1; }
 }

@@ -13,6 +13,7 @@ init_paths
 
 PUBLIC_DIR="$DEPLOY_DIR/public"
 LOG_DIR="$DEPLOY_DIR/logs"
+STAGE_DIR="$DEPLOY_DIR/tmp"  # same filesystem as public/: files are renamed into place
 
 echo "========================================="
 echo "Data Compression - $(date)"
@@ -26,8 +27,16 @@ if [ "$AVAILABLE" -lt 5 ]; then
 fi
 
 # Create archives directories
-mkdir -p "$PUBLIC_DIR/archives" "$LOG_DIR/archives"
+mkdir -p "$PUBLIC_DIR/archives" "$LOG_DIR/archives" "$STAGE_DIR"
 chmod 755 "$PUBLIC_DIR/archives" "$LOG_DIR/archives"
+
+# Serialize public/ changes with the hourly publish step, which waits on the same lock
+exec 7>>"$LOG_DIR/public.lock"
+if ! flock -w 3600 7; then
+    echo "ERROR: public.lock still held after 1h ($(lock_holder "$LOG_DIR/public.lock")). Aborting."
+    exit 1
+fi
+note_lock_holder "$LOG_DIR/public.lock"
 
 # === COMPRESS VALIDATION FILES (180+ days old) ===
 echo "Checking for validation files 180+ days old..."
@@ -62,20 +71,23 @@ if [ -n "$MONTHS_TO_COMPRESS" ]; then
                 BASENAMES+=("$(basename "$f")")
             done
             
-            # Create archive with all files for this month
-            tar czf "$ARCHIVE_PATH" -C "$PUBLIC_DIR" "${BASENAMES[@]}" 2>/dev/null
+            # Create archive with all files for this month, outside public/ so a
+            # concurrent upload never reads a partial one and a failure keeps the old one
+            TMP_ARCHIVE="$STAGE_DIR/$ARCHIVE_NAME"
+            tar czf "$TMP_ARCHIVE" -C "$PUBLIC_DIR" "${BASENAMES[@]}" 2>/dev/null
             
             # Verify archive was created and contains files
-            if [ -f "$ARCHIVE_PATH" ] && tar tzf "$ARCHIVE_PATH" >/dev/null 2>&1; then
+            if [ -f "$TMP_ARCHIVE" ] && tar tzf "$TMP_ARCHIVE" >/dev/null 2>&1; then
+                chmod 644 "$TMP_ARCHIVE"
+                mv -f "$TMP_ARCHIVE" "$ARCHIVE_PATH"
                 # Archive verified, safe to delete originals
                 for f in "${FILES_ARRAY[@]}"; do
                     rm -f "$f"
                 done
-                chmod 644 "$ARCHIVE_PATH"
                 echo "  ✓ Compressed $FILE_COUNT files → $ARCHIVE_NAME"
             else
                 echo "  ✗ Archive verification failed, keeping originals"
-                rm -f "$ARCHIVE_PATH"
+                rm -f "$TMP_ARCHIVE"
             fi
         fi
     done
@@ -112,10 +124,12 @@ if [ -f "$LOG_DIR/cron.log" ]; then
             
             # Verify compression
             if [ -f "$LOG_DIR/archives/$ARCHIVE_NAME" ] && gunzip -t "$LOG_DIR/archives/$ARCHIVE_NAME" 2>/dev/null; then
-                # Keep only last 500 lines in current log (use temp file safely)
+                # Keep only last 500 lines in current log. Truncate in place rather than
+                # mv: a batch still appending to cron.log would keep writing to the old inode.
                 TEMP_FILE=$(mktemp "$LOG_DIR/cron.log.XXXXXX")
                 tail -500 "$LOG_DIR/cron.log" > "$TEMP_FILE"
-                mv "$TEMP_FILE" "$LOG_DIR/cron.log"
+                cat "$TEMP_FILE" > "$LOG_DIR/cron.log"
+                rm -f "$TEMP_FILE"
                 chmod 644 "$LOG_DIR/archives/$ARCHIVE_NAME"
                 echo "  ✓ Compressed to $ARCHIVE_NAME"
             else
@@ -131,17 +145,19 @@ fi
 # === UPDATE FILES MANIFEST ===
 echo "Updating file manifest..."
 
-# List current uncompressed files (sorted newest first)
+# List current uncompressed files (sorted newest first); built outside public/, then renamed in
 cd "$PUBLIC_DIR" || exit 1
-ls -1 aroi_validation_*.json 2>/dev/null | sort -r | jq -R -s 'split("\n") | map(select(length > 0))' > files.json || echo '[]' > files.json
+MANIFEST="$STAGE_DIR/files.json"
+ls -1 aroi_validation_*.json 2>/dev/null | sort -r | jq -R -s 'split("\n") | map(select(length > 0))' > "$MANIFEST" || echo '[]' > "$MANIFEST"
 
 # Add archives to manifest
 if [ -d archives ] && ls archives/*.tar.gz >/dev/null 2>&1; then
     # List archives and merge with main list
-    (echo '{"files":'; cat files.json; echo ',"archives":'; ls -1 archives/*.tar.gz | jq -R -s 'split("\n") | map(select(length > 0))'; echo '}') | jq '{files: .files, archives: .archives}' > files.json.new 2>/dev/null && mv files.json.new files.json || echo '[]' > files.json
+    (echo '{"files":'; cat "$MANIFEST"; echo ',"archives":'; ls -1 archives/*.tar.gz | jq -R -s 'split("\n") | map(select(length > 0))'; echo '}') | jq '{files: .files, archives: .archives}' > "$MANIFEST.new" 2>/dev/null && mv "$MANIFEST.new" "$MANIFEST" || echo '[]' > "$MANIFEST"
 fi
 
-chmod 644 files.json 2>/dev/null || true
+chmod 644 "$MANIFEST" 2>/dev/null || true
+mv -f "$MANIFEST" files.json
 
 echo "Compression completed at $(date)"
 echo ""

@@ -11,7 +11,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEPLOY_DIR="$(dirname "$SCRIPT_DIR")"
 
-[[ -f "$DEPLOY_DIR/config.env" ]] && source "$DEPLOY_DIR/config.env"
+source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
+load_config || true
 
 DRY_RUN=false
 [[ "${1:-}" == "--dry-run" ]] && DRY_RUN=true
@@ -84,6 +85,16 @@ prune_r2() {
 
     $DRY_RUN || log "✅ R2 prune done"
 }
+
+# One prune at a time: hourly runs overlap while they wait for their uploads
+LOCK_FILE="$DEPLOY_DIR/logs/prune.lock"
+mkdir -p "$DEPLOY_DIR/logs"
+exec 9>>"$LOCK_FILE"
+if ! flock -n 9; then
+    log "Another prune is running ($(lock_holder "$LOCK_FILE")), skipping"
+    exit 0
+fi
+note_lock_holder "$LOCK_FILE"
 
 log "Starting (keep=$KEEP_BACKUPS, dry_run=$DRY_RUN)..."
 prune_local

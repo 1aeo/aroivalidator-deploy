@@ -11,6 +11,7 @@ logs/
 public/*.json
 public/files.json
 public/archives/
+tmp/
 
 # Python
 venv/
