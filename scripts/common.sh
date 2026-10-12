@@ -63,6 +63,10 @@ load_config() {
 # shellcheck disable=SC2034  # used by upload-common.sh and run-batch-validation.sh
 UPLOAD_SKIPPED=75
 
+# How long the publish step waits for public.lock
+# shellcheck disable=SC2034  # used by upload-common.sh and run-batch-validation.sh
+PUBLIC_LOCK_WAIT=900
+
 # Record "<pid> <start time>" in a lock file this process has just flock'ed
 note_lock_holder() { printf '%s %s\n' "$$" "$(date '+%Y-%m-%d %H:%M:%S')" > "$1"; }
 
@@ -75,8 +79,12 @@ lock_holder() {
         [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null && break
         [[ $try -eq 1 ]] && sleep 1  # a new holder may not have recorded itself yet
     done
-    # Recorded pid gone but lock still held: a child that inherited the fd (e.g. rclone) holds it
-    [[ "$pid" =~ ^[0-9]+$ ]] && ! kill -0 "$pid" 2>/dev/null && state=" (exited, a child still holds the lock)"
+    if [[ "$pid" =~ ^[0-9]+$ ]] && ! kill -0 "$pid" 2>/dev/null; then
+        # Recorded pid gone: if the lock is still held, a child that inherited the fd
+        # (e.g. rclone) holds it; otherwise the holder has finished since we checked
+        if flock -n "$1" true 2>/dev/null; then state=" (exited)"
+        else state=" (exited, a child still holds the lock)"; fi
+    fi
     echo "pid ${pid:-?}${state}, since ${since:-?}"
 }
 

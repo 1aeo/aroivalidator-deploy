@@ -41,15 +41,21 @@ echo "=== AROI Batch $(date) ==="
 # Hide credentials embedded in a remote URL
 redact() { sed -E 's#://[^/@[:space:]]+@#://***@#g' <<< "$1"; }
 
+# First 3 non-empty lines of a command's output, joined with " | "
+first_lines() {
+    local line out="" n=0
+    while IFS= read -r line && [[ $n -lt 3 ]]; do
+        [[ -n "$line" ]] || continue
+        out+="${out:+ | }$line"
+        n=$((n + 1))
+    done <<< "$1"
+    echo "$out"
+}
+
 # One loud line per failed update step; the run continues on the existing checkout
 update_warning() {
-    local step=$1 rc=$2 detail="" line n=0
-    while IFS= read -r line && [[ $n -lt 3 ]]; do  # first 3 non-empty lines of output
-        [[ -n "$line" ]] || continue
-        detail+="${detail:+ | }$line"
-        n=$((n + 1))
-    done <<< "$3"
-    detail=$(redact "$detail")
+    local step=$1 rc=$2 detail
+    detail=$(redact "$(first_lines "$3")")
     [[ $rc -eq 124 ]] && detail="timed out after ${GIT_TIMEOUT}s"
     echo "WARNING: code update failed at '$step' (exit $rc): ${detail:-no output} - running existing checkout"
 }
@@ -111,9 +117,13 @@ if [[ -d "$SRC" ]]; then
     echo "Publishing..."
     # Waits for compress-old-data.sh, which also rewrites public/
     exec 7>>"$PUBLIC_LOCK"
-    if flock -w 900 7; then
+    if flock -w "$PUBLIC_LOCK_WAIT" 7; then
         note_lock_holder "$PUBLIC_LOCK"
-        if ! rsync -a --temp-dir="$STAGE_DIR" --include='*.json' --exclude='*' "$SRC/" "$WEB_DIR/" 2>/dev/null; then
+        rc=0
+        out=$(rsync -a --temp-dir="$STAGE_DIR" --include='*.json' --exclude='*' "$SRC/" "$WEB_DIR/" 2>&1) || rc=$?
+        if [[ $rc -ne 0 ]]; then
+            out=$(first_lines "$out")
+            echo "WARNING: publish rsync failed (exit $rc): ${out:-no output} - copying results newer than files.json instead"
             while IFS= read -r -d '' f; do
                 publish_file "$f" "${f##*/}" || true
             done < <(find "$SRC" -maxdepth 1 -name "*.json" -newer "$WEB_DIR/files.json" -print0 2>/dev/null)
@@ -128,7 +138,7 @@ if [[ -d "$SRC" ]]; then
             | sort -r | jq -Rs 'split("\n") | map(select(length > 0))' > "$STAGE_DIR/files.json" \
             && mv -f "$STAGE_DIR/files.json" "$WEB_DIR/files.json"
     else
-        echo "WARNING: not publishing - public.lock still held after 15 min ($(lock_holder "$PUBLIC_LOCK")); the next run publishes this file"
+        echo "WARNING: not publishing - public.lock still held after ${PUBLIC_LOCK_WAIT}s ($(lock_holder "$PUBLIC_LOCK")); the next run publishes this file"
     fi
     exec 7>&-
 fi

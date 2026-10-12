@@ -31,9 +31,10 @@ mkdir -p "$PUBLIC_DIR/archives" "$LOG_DIR/archives" "$STAGE_DIR"
 chmod 755 "$PUBLIC_DIR/archives" "$LOG_DIR/archives"
 
 # Serialize public/ changes with the hourly publish step, which waits on the same lock
+COMPRESS_LOCK_WAIT=3600
 exec 7>>"$LOG_DIR/public.lock"
-if ! flock -w 3600 7; then
-    echo "ERROR: public.lock still held after 1h ($(lock_holder "$LOG_DIR/public.lock")). Aborting."
+if ! flock -w "$COMPRESS_LOCK_WAIT" 7; then
+    echo "ERROR: public.lock still held after ${COMPRESS_LOCK_WAIT}s ($(lock_holder "$LOG_DIR/public.lock")). Aborting."
     exit 1
 fi
 note_lock_holder "$LOG_DIR/public.lock"
