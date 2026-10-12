@@ -95,19 +95,32 @@ lock_pid_alive() {
     LOCK_PID="" LOCK_SINCE=""
     read -r LOCK_PID LOCK_SINCE 2>/dev/null < "$1" || true
     [[ "$LOCK_PID" =~ ^[0-9]+$ ]] && kill -0 "$LOCK_PID" 2>/dev/null || return 1
-    # Start time unknown (no procps/GNU date): trust kill -0
-    if age=$(ps -o etimes= -p "$LOCK_PID" 2>/dev/null) && since_s=$(date -d "$LOCK_SINCE" +%s 2>/dev/null); then
-        (( $(date +%s) - age <= since_s + 2 ))
-    fi
+    age=$(ps -o etimes= -p "$LOCK_PID" 2>/dev/null) || age=""
+    age=${age//[[:space:]]/}
+    # No elapsed time: the process exited after kill -0, or ps has no etimes (then
+    # trust kill -0). Ask kill -0 again, so an exit in between reads as not alive.
+    [[ "$age" =~ ^[0-9]+$ ]] || { kill -0 "$LOCK_PID" 2>/dev/null; return; }
+    # Recorded start time unreadable (e.g. no GNU date): trust ps
+    since_s=$(date -d "$LOCK_SINCE" +%s 2>/dev/null) || return 0
+    (( $(date +%s) - age <= since_s + 2 ))
 }
 
 # Remove files an interrupted publish or compress left in tmp/ (rsync --temp-dir
 # "<name>.XXXXXX", staged latest.json/files.json/archives). Call with public.lock held.
 # Regular files directly in tmp/ only: upload snapshots (tmp/upload-*.snap/) are directories.
 clean_stage_dir() {
-    local n
-    n=$(find "$1" -maxdepth 1 -type f -print -delete 2>/dev/null | wc -l) || n=0
-    [[ $n -eq 0 ]] || echo "Removed $((n)) leftover temp file(s) from ${1##*/}/ (interrupted publish)"
+    local out line n=0 err=""
+    out=$(find "$1" -maxdepth 1 -type f -print -delete 2>&1) || true
+    # Count the listed files that are gone; any other output line is an error
+    while IFS= read -r line; do
+        if [[ "$line" == "$1/"* ]]; then
+            [[ -e "$line" ]] || n=$((n + 1))
+        elif [[ -n "$line" ]]; then
+            err=${err:-$line}
+        fi
+    done <<< "$out"
+    [[ $n -eq 0 ]] || echo "Removed $n leftover temp file(s) from ${1##*/}/ (interrupted publish)"
+    [[ -z "$err" ]] || echo "WARNING: could not clean up ${1##*/}/: $err"
 }
 
 # === Logging Functions ===
