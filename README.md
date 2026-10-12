@@ -131,6 +131,7 @@ Per run, `cron.log` shows:
 HEAD is now at 6e070ff ...                     # code update succeeded
 WARNING: code update failed at 'git fetch origin main' (exit 128): ... - running existing checkout
 Code: 6e070ff <subject> (origin/main 6e070ff)  # code that ran; full SHA is passed to the validator as AROIVALIDATOR_COMMIT
+Note: validating while DO upload (pid 889905, since 2026-10-12 00:00:31) is still running
 Validation + publish done in 41s, validation lock released
 ↷ skipping DO upload: previous still running (pid 889905, since 2026-10-12 00:00:31) [batch 01:00:01]
 ✓ R2 (95s) [batch 01:00:01]

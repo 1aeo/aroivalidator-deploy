@@ -88,6 +88,19 @@ lock_holder() {
     echo "pid ${pid:-?}${state}, since ${since:-?}"
 }
 
+# Without locking it, read a lock file's "<pid> <since>" into LOCK_PID/LOCK_SINCE and
+# succeed if that process is still alive and started by <since> (not a reused pid)
+lock_pid_alive() {
+    local age since_s
+    LOCK_PID="" LOCK_SINCE=""
+    read -r LOCK_PID LOCK_SINCE 2>/dev/null < "$1" || true
+    [[ "$LOCK_PID" =~ ^[0-9]+$ ]] && kill -0 "$LOCK_PID" 2>/dev/null || return 1
+    # Start time unknown (no procps/GNU date): trust kill -0
+    if age=$(ps -o etimes= -p "$LOCK_PID" 2>/dev/null) && since_s=$(date -d "$LOCK_SINCE" +%s 2>/dev/null); then
+        (( $(date +%s) - age <= since_s + 2 ))
+    fi
+}
+
 # Remove files an interrupted publish or compress left in tmp/ (rsync --temp-dir
 # "<name>.XXXXXX", staged latest.json/files.json/archives). Call with public.lock held.
 # Regular files directly in tmp/ only: upload snapshots (tmp/upload-*.snap/) are directories.

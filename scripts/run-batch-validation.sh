@@ -94,6 +94,15 @@ else
     unset AROIVALIDATOR_COMMIT
 fi
 
+# An upload from an earlier run still going competes with the validator for bandwidth
+# and CPU: say so, to tell dips in this hour's results from code regressions. Only reads
+# the lock files (no flock), so it cannot delay or skip anything.
+for provider in "DO" "R2"; do
+    if lock_pid_alive "$LOG_DIR/upload-${provider,,}.lock"; then
+        echo "Note: validating while $provider upload (pid $LOCK_PID, since $LOCK_SINCE) is still running"
+    fi
+done
+
 cd "$CODE_DIR"
 source venv/bin/activate
 
