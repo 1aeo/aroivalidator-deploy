@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # AROI Validator - Prune Old Backups
-# Removes old local and R2 backups (keeps last N)
+# Removes old local, DigitalOcean Spaces, and R2 backups (keeps last N).
+# Spaces snapshots live under _backups/ in the same bucket as the live archive.
+# They were previously kept forever, which is a full extra copy of the bucket per day.
 #
 # Usage:
 #   ./prune-backups.sh              # Prune old backups
@@ -48,6 +50,10 @@ prune_local() {
         if $DRY_RUN; then
             log "[DRY-RUN] Would remove: $(basename "$dir") ($size)"
         else
+            # Hard-link backups copy directory modes from public/. A read-only
+            # archives/ would make rm -rf fail. Never chmod files: they share
+            # inodes with the published files.
+            find "$dir" -type d ! -perm -u=rwx -exec chmod u+rwx {} + 2>/dev/null || true
             rm -rf "$dir"
             log "  Removed: $(basename "$dir") ($size)"
         fi
@@ -86,6 +92,37 @@ prune_r2() {
     $DRY_RUN || log "✅ R2 prune done"
 }
 
+# Same retention as R2. The remote name matches ensure_do_remote in upload-common.sh.
+prune_do() {
+    [[ -n "${DO_SPACES_BUCKET:-}" && -x "$RCLONE" ]] || return 0
+
+    local bucket="aroi-spaces:${DO_SPACES_BUCKET}"
+    local all
+    all=$("$RCLONE" lsf "$bucket/_backups/" --dirs-only 2>/dev/null) || return 0
+    local count=$(count_lines "$all")
+
+    if [[ "$count" -le "$PRUNE_THRESHOLD" ]]; then
+        log "DO: $count backups (need >$PRUNE_THRESHOLD to prune)"
+        return 0
+    fi
+
+    local to_delete
+    to_delete=$(echo "$all" | sort -r | tail -n +$((KEEP_BACKUPS + 1)))
+    log "DO: $count found, pruning $(count_lines "$to_delete") (keeping $KEEP_BACKUPS)..."
+
+    while IFS= read -r backup; do
+        [[ -z "$backup" ]] && continue
+        if $DRY_RUN; then
+            log "[DRY-RUN] Would remove: DO/_backups/$backup"
+        else
+            "$RCLONE" purge "$bucket/_backups/$backup" 2>/dev/null || true
+            log "  Removed: DO/_backups/$backup"
+        fi
+    done <<< "$to_delete"
+
+    $DRY_RUN || log "✅ DO prune done"
+}
+
 # One prune at a time: hourly runs overlap while they wait for their uploads
 LOCK_FILE="$DEPLOY_DIR/logs/prune.lock"
 mkdir -p "$DEPLOY_DIR/logs"
@@ -98,5 +135,6 @@ note_lock_holder "$LOCK_FILE"
 
 log "Starting (keep=$KEEP_BACKUPS, dry_run=$DRY_RUN)..."
 prune_local
+prune_do
 prune_r2
 log "Finished"
