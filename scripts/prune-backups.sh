@@ -24,6 +24,10 @@ RCLONE="${RCLONE_PATH:-$(command -v rclone 2>/dev/null || echo "$HOME/bin/rclone
 KEEP_BACKUPS="${KEEP_BACKUPS:-7}"
 [[ "$KEEP_BACKUPS" -lt 1 ]] && KEEP_BACKUPS=1
 PRUNE_THRESHOLD=$((KEEP_BACKUPS + 2))
+# The droplet is 80GB and the archive is ~23GB, so seven full local copies
+# cannot exist. One hard-link snapshot is enough; public/ is the current copy.
+KEEP_LOCAL_BACKUPS="${KEEP_LOCAL_BACKUPS:-1}"
+[[ "$KEEP_LOCAL_BACKUPS" -lt 1 ]] && KEEP_LOCAL_BACKUPS=1
 
 log() { echo "[PRUNE] [$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
 count_lines() { local c; c=$(echo "$1" | grep -c . 2>/dev/null) || c=0; echo "$c"; }
@@ -34,14 +38,14 @@ prune_local() {
     all=$(ls -1dt "$BACKUP_DIR"/backup-* 2>/dev/null) || return 0
     local count=$(count_lines "$all")
 
-    if [[ "$count" -le "$PRUNE_THRESHOLD" ]]; then
-        log "Local: $count backups (need >$PRUNE_THRESHOLD to prune)"
+    if [[ "$count" -le "$KEEP_LOCAL_BACKUPS" ]]; then
+        log "Local: $count backups (keeping $KEEP_LOCAL_BACKUPS)"
         return 0
     fi
 
     local to_delete
-    to_delete=$(echo "$all" | tail -n +$((KEEP_BACKUPS + 1)))
-    log "Local: $count found, pruning $(count_lines "$to_delete") (keeping $KEEP_BACKUPS)..."
+    to_delete=$(echo "$all" | tail -n +$((KEEP_LOCAL_BACKUPS + 1)))
+    log "Local: $count found, pruning $(count_lines "$to_delete") (keeping $KEEP_LOCAL_BACKUPS)..."
 
     while IFS= read -r dir; do
         [[ -z "$dir" ]] && continue
@@ -133,7 +137,7 @@ if ! flock -n 9; then
 fi
 note_lock_holder "$LOCK_FILE"
 
-log "Starting (keep=$KEEP_BACKUPS, dry_run=$DRY_RUN)..."
+log "Starting (remote_keep=$KEEP_BACKUPS, local_keep=$KEEP_LOCAL_BACKUPS, dry_run=$DRY_RUN)..."
 prune_local
 prune_do
 prune_r2
