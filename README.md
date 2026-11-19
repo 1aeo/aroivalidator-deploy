@@ -122,23 +122,6 @@ when rclone finishes; one left by a killed upload is removed by the next upload
 to the same provider. If a snapshot cannot be removed, the upload logs a
 `WARNING` and syncs `public/` directly until it is gone.
 
-The bucket-root `onionsurge/` prefix is reserved for a separate publisher.
-All DO/R2 uploads and backups exclude `/onionsurge/**`, preserving existing
-objects there and refusing to copy files into it from this application's output.
-The anchored rule leaves nested paths and lookalike names in normal AROI sync
-scope. Do not use `--delete-excluded`. Backup pruning operates only below
-`_backups/`; storage lifecycle rules and other bucket writers must also preserve
-the reserved prefix.
-
-Test the boundary against temporary local directories with an installed rclone:
-
-```bash
-RCLONE_PATH=/path/to/rclone bash tests/test-reserved-prefix.sh
-```
-
-The test calls the shared upload and backup helpers without loading private
-configuration or accessing cloud storage.
-
 Temp files an interrupted publish leaves in `tmp/` are removed by the next
 publish or compress once it holds `public.lock` (logged as `Removed N leftover
 temp file(s) from tmp/`); snapshot directories are left alone.

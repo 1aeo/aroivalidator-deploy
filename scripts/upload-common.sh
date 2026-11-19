@@ -35,8 +35,6 @@ init_upload() {
     
     # Cache rclone options array once
     RCLONE_OPTS_ARRAY=(
-        # Reserved for another publisher; exclude from every root sync/backup.
-        "--exclude=/onionsurge/**"
         "--transfers=$TRANSFERS" "--checkers=$CHECKERS" "--buffer-size=$BUFFER"
         "--s3-upload-concurrency=$S3_CONC" "--s3-chunk-size=$S3_CHUNK"
         "--fast-list" "--stats=10s" "--stats-one-line" "--log-level=NOTICE"
