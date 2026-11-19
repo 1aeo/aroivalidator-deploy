@@ -153,27 +153,49 @@ rclone_summary() {
         }'
 }
 
-# Backup if not done today (returns 0 if backup made, 1 if skipped or failed)
+# Backup if not done today (returns 0 if backup made, 1 if skipped or failed).
+# Local backups hard-link SOURCE_DIR. public/ is already that dataset; syncing
+# it down from Spaces copied ~23 GiB out of the bucket once a day (most of this
+# bucket's outbound transfer) onto a droplet that cannot hold seven full copies.
+# Remote backups stay a same-bucket copy under _backups/. prune-backups.sh
+# keeps the newest KEEP_BACKUPS of those.
 maybe_backup() {
     local bucket="$1" marker="$2" type="$3" force="${4:-false}" rc=0
     [[ "$force" == "true" ]] || { [[ -f "$marker" && "$(cat "$marker")" == "$TODAY" ]] && return 1; }
-    
-    local target
+
+    local target err
     if [[ "$type" == "local" ]]; then
         target="$BACKUP_DIR/backup-$TIMESTAMP"
         log "Local backup → $target"
         mkdir -p "$target"
-    else
-        target="$bucket/_backups/$TIMESTAMP"
-        log "Remote backup → $target"
+        if err=$(cp -al "$SOURCE_DIR/." "$target" 2>&1); then
+            find "$target" -type d ! -perm -u=rwx -exec chmod u+rwx {} + 2>/dev/null || true
+            echo "$TODAY" > "$marker"
+            log_success "Local backup done"
+            return 0
+        fi
+        # Cross-device link, or a directory we cannot read. Copy the local tree.
+        # Still do not read the bucket: that is the transfer we are avoiding.
+        log "Hard-link backup failed (${err%%$'\n'*}); copying $SOURCE_DIR locally"
+        "$RCLONE" sync "$SOURCE_DIR" "$target" --exclude "_backups/**" "${RCLONE_OPTS_ARRAY[@]}" 2>&1 | rclone_summary || rc=${PIPESTATUS[0]}
+        echo "$TODAY" > "$marker"  # attempted today, as before: a failed backup is not retried hourly
+        if [[ $rc -ne 0 ]]; then
+            log_error "Local backup to $target failed (rclone exit $rc)"
+            return 1
+        fi
+        log_success "Local backup done"
+        return 0
     fi
+
+    target="$bucket/_backups/$TIMESTAMP"
+    log "Remote backup → $target"
     "$RCLONE" sync "$bucket" "$target" --exclude "_backups/**" "${RCLONE_OPTS_ARRAY[@]}" 2>&1 | rclone_summary || rc=${PIPESTATUS[0]}
     echo "$TODAY" > "$marker"  # attempted today, as before: a failed backup is not retried hourly
     if [[ $rc -ne 0 ]]; then
-        log_error "${type^} backup to $target failed (rclone exit $rc)"
+        log_error "Remote backup to $target failed (rclone exit $rc)"
         return 1
     fi
-    log_success "${type^} backup done"
+    log_success "Remote backup done"
 }
 
 # Main upload function
