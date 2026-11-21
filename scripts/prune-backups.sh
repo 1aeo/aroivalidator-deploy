@@ -53,8 +53,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --keep)
             [[ $# -ge 2 ]] || { echo "ERROR: --keep requires a non-negative integer" >&2; exit 2; }
-            [[ "$2" =~ ^[0-9]+$ ]] || { echo "ERROR: invalid --keep value '$2'" >&2; exit 2; }
-            KEEP_LEGACY_BACKUPS="$((10#$2))"
+            KEEP_LEGACY_BACKUPS="$2"
             shift 2
             ;;
         --provider)
@@ -67,8 +66,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --tpslimit)
             [[ $# -ge 2 ]] || { echo "ERROR: --tpslimit requires a positive integer" >&2; exit 2; }
-            [[ "$2" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: invalid --tpslimit '$2'" >&2; exit 2; }
-            TPSLIMIT="$((10#$2))"
+            TPSLIMIT="$2"
             shift 2
             ;;
         --help|-h)
@@ -83,16 +81,15 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Validate environment-supplied integers before numeric comparisons
-if [[ ! "$KEEP_LEGACY_BACKUPS" =~ ^[0-9]+$ ]] || (( 10#$KEEP_LEGACY_BACKUPS > 3650 )); then
+# Validate argument/environment integers without Bash arithmetic overflow
+if ! KEEP_LEGACY_BACKUPS=$(parse_int_in_range "$KEEP_LEGACY_BACKUPS" 0 3650); then
     echo "ERROR: invalid KEEP_LEGACY_BACKUPS='$KEEP_LEGACY_BACKUPS' (expected integer 0-3650)" >&2
     exit 2
 fi
-KEEP_LEGACY_BACKUPS=$((10#$KEEP_LEGACY_BACKUPS))
 
 if [[ -n "$TPSLIMIT" ]]; then
-    if [[ ! "$TPSLIMIT" =~ ^[1-9][0-9]*$ ]]; then
-        echo "ERROR: invalid DO_PURGE_TPSLIMIT/tpslimit='$TPSLIMIT'" >&2
+    if ! TPSLIMIT=$(parse_int_in_range "$TPSLIMIT" 1 10000); then
+        echo "ERROR: invalid DO_PURGE_TPSLIMIT/tpslimit='$TPSLIMIT' (expected integer 1-10000)" >&2
         exit 2
     fi
 fi
@@ -105,14 +102,19 @@ ERRORS=0
 prune_local() {
     [[ -d "$BACKUP_DIR" ]] || { log "Local: backup directory not present ($BACKUP_DIR)"; return 0; }
 
-    local all
-    all=$(
-        cd "$BACKUP_DIR"
-        find . -maxdepth 1 -type d -name 'backup-*' 2>/dev/null \
-            | sed 's|^\./||' \
-            | grep -E '^backup-[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{6}$' \
-            | LC_ALL=C sort -r || true
-    )
+    local raw_dirs all
+    if ! raw_dirs=$(
+        cd "$BACKUP_DIR" || exit 1
+        find . -maxdepth 1 -type d -name 'backup-*'
+    ); then
+        log "ERROR: failed scanning local backup directory ($BACKUP_DIR)"
+        ERRORS=$((ERRORS + 1))
+        return 1
+    fi
+    all=$(printf '%s\n' "$raw_dirs" \
+        | sed 's|^\./||' \
+        | grep -E '^backup-[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{6}$' \
+        | LC_ALL=C sort -r || true)
     local count
     count=$(count_lines "$all")
 
@@ -150,7 +152,7 @@ prune_remote() {
     local label=$1 bucket=$2
     [[ -x "$RCLONE" ]] || { log "ERROR: rclone not found at $RCLONE"; ERRORS=$((ERRORS + 1)); return 1; }
 
-    if (( KEEP_LEGACY_BACKUPS == 0 )) && ! $FORCE; then
+    if ! $DRY_RUN && (( KEEP_LEGACY_BACKUPS == 0 )) && ! $FORCE; then
         local zst_check
         zst_check=$("$RCLONE" lsf "$bucket/_backups/" --max-depth 1 --files-only --include "aroi-*.tar.zst" 2>/dev/null || true)
         if [[ -z "$zst_check" ]]; then
@@ -223,16 +225,24 @@ note_lock_holder "$LOCK_FILE"
 log "Starting (provider=$PROVIDER, keep_legacy=$KEEP_LEGACY_BACKUPS, dry_run=$DRY_RUN)..."
 
 if [[ "$PROVIDER" == "all" || "$PROVIDER" == "local" ]]; then
-    prune_local
+    prune_local || true
 fi
 if [[ "$PROVIDER" == "all" || "$PROVIDER" == "do" ]]; then
     if [[ -n "${DO_SPACES_BUCKET:-}" ]]; then
-        prune_remote "DO" "aroi-spaces:${DO_SPACES_BUCKET}" || true
+        DO_URI=$(resolve_do_bucket)
+        prune_remote "DO" "$DO_URI" || true
+    elif [[ "$PROVIDER" == "do" ]]; then
+        log "ERROR: DO_SPACES_BUCKET is not set"
+        ERRORS=$((ERRORS + 1))
     fi
 fi
 if [[ "$PROVIDER" == "all" || "$PROVIDER" == "r2" ]]; then
     if [[ -n "${R2_BUCKET:-}" ]]; then
-        prune_remote "R2" "aroi-r2:${R2_BUCKET}" || true
+        R2_URI=$(resolve_r2_bucket)
+        prune_remote "R2" "$R2_URI" || true
+    elif [[ "$PROVIDER" == "r2" ]]; then
+        log "ERROR: R2_BUCKET is not set"
+        ERRORS=$((ERRORS + 1))
     fi
 fi
 

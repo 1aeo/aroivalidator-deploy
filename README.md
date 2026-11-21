@@ -134,13 +134,15 @@ seconds without traversing historical objects or `_backups/`.
 |----------------|---------|-----------|
 | `validation.lock` | update + validation + publish | run exits `Already running (... pid N, since T)` |
 | `public.lock` | publish step, `compress-old-data.sh` snapshot/cleanup, upload snapshot (< 1 s) | waits (publish and snapshot 15 min, compress 1 h) |
+| `cron-log.lock` | `run-batch-validation.sh` (shared), `cron.log` rotation (exclusive) | waits up to 5 min so rotation never drops log lines |
 | `compress.lock` | `compress-old-data.sh` | duplicate compress exits cleanly |
 | `upload-do.lock`, `upload-r2.lock` | `upload-do.sh`, `upload-r2.sh` | live upload skipped; backup uploads wait up to 5 min |
 | `prune.lock` | `prune-backups.sh` | prune skipped |
 
 Lock files hold the holder's `pid start-time` and are never deleted.
 
-Nothing in `public/` is written in place: files reach it by rename from `tmp/`.
+Nothing in `public/` is written in place: publish steps stage `.aroi-tmp.*` files
+directly on `public/`'s filesystem and atomically rename them into place.
 Each live upload takes a hard-link snapshot of `public/` (`tmp/upload-do.snap/`,
 `tmp/upload-r2.snap/`) under `public.lock`. The snapshot is removed when rclone
 finishes; one left by a killed upload is removed by the next upload to the same

@@ -29,6 +29,14 @@ RUN_TAG="batch $(date '+%H:%M:%S')"
 
 mkdir -p "$LOG_DIR" "$WEB_DIR" "$ARCHIVE_DIR" "$STAGE_DIR"
 
+# Hold a shared lock across this batch's log output so monthly cron.log rotation
+# in compress-old-data.sh waits until no batch run can append mid-truncate.
+CRON_LOG_LOCK="$LOG_DIR/cron-log.lock"
+exec 6>>"$CRON_LOG_LOCK"
+if ! flock -s -w 300 6; then
+    echo "WARNING: cron-log.lock busy after 300s; continuing without log-rotation serialization" >&2
+fi
+
 # Atomic lock file to prevent concurrent runs (race-condition safe)
 exec 9>>"$LOCK_FILE"
 if ! flock -n 9; then
@@ -66,7 +74,7 @@ update_warning() {
 
 # Security: Only fetch/reset if remote URL is from expected source (case-insensitive)
 REMOTE_URL=$(git -C "$CODE_DIR" config --get remote.origin.url 2>/dev/null || echo "")
-REMOTE_URL_LOWER="${REMOTE_URL,,}"  # Convert to lowercase for comparison
+REMOTE_URL_LOWER=$(printf '%s' "$REMOTE_URL" | tr '[:upper:]' '[:lower:]')
 if [[ "$REMOTE_URL_LOWER" == *"github.com/1aeo/aroivalidator"* || "$REMOTE_URL_LOWER" == *"github.com:1aeo/aroivalidator"* ]]; then
     rc=0
     out=$(GIT_TERMINAL_PROMPT=0 timeout "$GIT_TIMEOUT" git -C "$CODE_DIR" fetch origin main 2>&1) || rc=$?
@@ -99,7 +107,8 @@ fi
 # and CPU: say so, to tell dips in this hour's results from code regressions. Only reads
 # the lock files (no flock), so it cannot delay or skip anything.
 for provider in "DO" "R2"; do
-    if lock_pid_alive "$LOG_DIR/upload-${provider,,}.lock"; then
+    provider_lower=$(printf '%s' "$provider" | tr '[:upper:]' '[:lower:]')
+    if lock_pid_alive "$LOG_DIR/upload-${provider_lower}.lock"; then
         echo "Note: validating while $provider upload (pid $LOCK_PID, since $LOCK_SINCE) is still running"
     fi
 done
@@ -120,10 +129,15 @@ BATCH_LIMIT=0 PARALLEL=true MAX_WORKERS=20 BATCH_QUIET="$BATCH_QUIET" python3 ar
     --ciiss-versions "$CIISS_VERSIONS" \
     || { echo "Validation failed"; exit 1; }
 
-# Stage into STAGE_DIR, set 0644, and atomically rename into WEB_DIR.
+# Stage directly on WEB_DIR's filesystem, set 0644, and atomically rename into place.
 publish_file() {
-    local src=$1 dest_name=$2
-    cp "$src" "$STAGE_DIR/$dest_name" && chmod 644 "$STAGE_DIR/$dest_name" && mv -f "$STAGE_DIR/$dest_name" "$WEB_DIR/$dest_name"
+    local src=$1 dest_name=$2 tmp
+    tmp=$(mktemp "$WEB_DIR/.aroi-tmp.XXXXXX") || return 1
+    if cp "$src" "$tmp" && chmod 644 "$tmp" && mv -f "$tmp" "$WEB_DIR/$dest_name"; then
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
 }
 
 # Publish results into public/, keeping only latest.json in validation_results/
@@ -136,6 +150,7 @@ if [[ -d "$SRC" ]]; then
     if flock -w "$PUBLIC_LOCK_WAIT" 7; then
         note_lock_holder "$PUBLIC_LOCK"
         clean_stage_dir "$STAGE_DIR"
+        clean_publish_temps "$WEB_DIR"
 
         published_latest=""
         while IFS= read -r -d '' f; do
@@ -185,7 +200,7 @@ exec 9>&-
 # Run one provider's upload; prints a single result line
 run_upload() {
     local name=$1 id=$2 rc=0 t0=$SECONDS
-    "$SCRIPT_DIR/upload-$id.sh" "$WEB_DIR" >> "$LOG_DIR/upload-$id.log" 2>&1 || rc=$?
+    "$SCRIPT_DIR/upload-$id.sh" "$WEB_DIR" >> "$LOG_DIR/upload-$id.log" 2>&1 6>&- || rc=$?
     case $rc in
         0) echo "✓ $name ($((SECONDS - t0))s) [$RUN_TAG]" ;;
         "$UPLOAD_SKIPPED") echo "↷ skipping $name upload: previous still running ($(lock_holder "$LOG_DIR/upload-$id.lock")) [$RUN_TAG]" ;;
@@ -214,11 +229,18 @@ if [[ "$CLOUD_UPLOAD" == "true" ]]; then
     else echo "✓ All uploads done [$RUN_TAG]"; fi
 fi
 
-# Daily zstd backup archive refresh & completed-month cleanup (once per day)
+# Daily zstd backup archive refresh & completed-month cleanup (at most once per day)
 TODAY=$(date '+%Y-%m-%d')
 LAST_ARCHIVE_MARKER="$LOG_DIR/last-archive-date"
-if [[ -x "$SCRIPT_DIR/compress-old-data.sh" ]] && [[ ! -f "$LAST_ARCHIVE_MARKER" || "$(cat "$LAST_ARCHIVE_MARKER" 2>/dev/null)" != "$TODAY" ]]; then
-    if "$SCRIPT_DIR/compress-old-data.sh" --daily >> "$LOG_DIR/compression.log" 2>&1; then
+LAST_ARCHIVE_ATTEMPT_MARKER="$LOG_DIR/last-archive-attempt-date"
+last_done=$(cat "$LAST_ARCHIVE_MARKER" 2>/dev/null || true)
+last_attempt=$(cat "$LAST_ARCHIVE_ATTEMPT_MARKER" 2>/dev/null || true)
+if [[ -x "$SCRIPT_DIR/compress-old-data.sh" && "$last_done" != "$TODAY" && "$last_attempt" != "$TODAY" ]]; then
+    tmp_attempt=$(mktemp "$LOG_DIR/.aroi-tmp.attempt.XXXXXX")
+    printf '%s\n' "$TODAY" > "$tmp_attempt"
+    chmod 644 "$tmp_attempt"
+    mv -f "$tmp_attempt" "$LAST_ARCHIVE_ATTEMPT_MARKER"
+    if "$SCRIPT_DIR/compress-old-data.sh" --daily >> "$LOG_DIR/compression.log" 2>&1 6>&-; then
         echo "✓ Daily zstd archive up to date [$RUN_TAG]"
     else
         echo "⚠ Daily zstd archive failed (see logs/compression.log) [$RUN_TAG]"
@@ -226,3 +248,4 @@ if [[ -x "$SCRIPT_DIR/compress-old-data.sh" ]] && [[ ! -f "$LAST_ARCHIVE_MARKER"
 fi
 
 echo "=== Complete $(date) [$RUN_TAG] ==="
+exec 6>&-

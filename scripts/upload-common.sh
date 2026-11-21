@@ -8,9 +8,9 @@ set -euo pipefail
 # Source shared functions
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
-# Remote names (unique to this project)
-AROI_R2_REMOTE="aroi-r2"
-AROI_DO_REMOTE="aroi-spaces"
+# Remote names (unique to this project; overridable in env or config.env)
+: "${AROI_R2_REMOTE:=aroi-r2}"
+: "${AROI_DO_REMOTE:=aroi-spaces}"
 
 # Cached rclone options (populated by init_upload)
 declare -a RCLONE_OPTS_ARRAY=()
@@ -175,6 +175,7 @@ rclone_summary() {
 do_upload() {
     local bucket=$1 provider_id=$2 full_copy=${3:-false}
     local rc=0 ledger_file work_dir local_list pending_file meta_file tmp_ledger pending_count mf
+    local ledger_matches=true
 
     snapshot_source || return 1
 
@@ -187,10 +188,13 @@ do_upload() {
 
     list_nonempty_validation_files "$SYNC_SOURCE" > "$local_list"
 
-    if [[ "$full_copy" == "true" || ! -s "$ledger_file" ]]; then
+    if ! read_upload_ledger "$ledger_file" "$bucket" "$tmp_ledger"; then
+        ledger_matches=false
+    fi
+
+    if [[ "$full_copy" == "true" || "$ledger_matches" != "true" || ! -s "$tmp_ledger" ]]; then
         cp "$local_list" "$pending_file"
     else
-        grep -E "$AROI_JSON_REGEX" "$ledger_file" 2>/dev/null | LC_ALL=C sort -u > "$tmp_ledger" || true
         comm -23 "$local_list" "$tmp_ledger" > "$pending_file"
     fi
 
@@ -207,12 +211,14 @@ do_upload() {
             return "$rc"
         fi
         {
-            [[ -f "$ledger_file" ]] && grep -E "$AROI_JSON_REGEX" "$ledger_file" 2>/dev/null || true
+            [[ "$ledger_matches" == "true" && -s "$tmp_ledger" ]] && cat "$tmp_ledger" || true
             cat "$pending_file"
-        } | LC_ALL=C sort -u > "$work_dir/ledger.new"
-        chmod 644 "$work_dir/ledger.new"
-        mv -f "$work_dir/ledger.new" "$ledger_file"
+        } > "$work_dir/ledger.entries"
+        write_upload_ledger "$ledger_file" "$bucket" "$work_dir/ledger.entries"
     else
+        if [[ "$ledger_matches" != "true" && -e "$ledger_file" ]]; then
+            write_upload_ledger "$ledger_file" "$bucket" "$pending_file"
+        fi
         log "No new hourly JSON files to copy"
     fi
 
@@ -243,19 +249,20 @@ do_upload() {
 # $bucket/_backups/ (never deletes remote backup objects).
 upload_zstd_backups() {
     local bucket=$1 month=${2:-}
-    local list_file rc=0 count=0 name
+    local work_dir list_file rc=0 count=0 name
 
     if [[ -n "$month" ]]; then
         validate_pattern "$month" '^[0-9]{6}$' "month" || return 1
     fi
     [[ -d "$ARCHIVE_DIR" ]] || { log_error "Archive directory not found: $ARCHIVE_DIR"; return 1; }
 
-    list_file=$(mktemp "$STAGE_DIR/backup-files.XXXXXX")
+    work_dir=$(mktemp -d "$STAGE_DIR/backup-files.XXXXXX")
+    list_file="$work_dir/files.txt"
     if [[ -n "$month" ]]; then
         for name in "aroi-${month}.tar.zst" "aroi-${month}.list"; do
             if [[ ! -s "$ARCHIVE_DIR/$name" ]]; then
                 log_error "Missing or empty backup artifact: $ARCHIVE_DIR/$name"
-                rm -f "$list_file"
+                rm -rf "$work_dir"
                 return 1
             fi
             echo "$name" >> "$list_file"
@@ -270,7 +277,7 @@ upload_zstd_backups() {
         ) > "$list_file"
         if [[ ! -s "$list_file" ]]; then
             log "No zstd archives found in $ARCHIVE_DIR"
-            rm -f "$list_file"
+            rm -rf "$work_dir"
             return 0
         fi
     fi
@@ -280,7 +287,7 @@ upload_zstd_backups() {
     "$RCLONE" copy "$ARCHIVE_DIR" "$bucket/_backups" \
         --files-from "$list_file" \
         "${RCLONE_OPTS_ARRAY[@]}" 2>&1 | rclone_summary || rc=${PIPESTATUS[0]}
-    rm -f "$list_file"
+    rm -rf "$work_dir"
     if [[ $rc -ne 0 ]]; then
         log_error "Backup archive upload to $bucket/_backups failed (rclone exit $rc)"
         return "$rc"

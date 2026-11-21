@@ -33,6 +33,7 @@ RCLONE="${RCLONE_PATH:-$(command -v rclone 2>/dev/null || echo "$HOME/bin/rclone
 : "${DO_ENABLED:=false}" "${R2_ENABLED:=false}"
 ZSTD_LEVEL=$(validate_int_range "ZSTD_LEVEL" "${ZSTD_LEVEL:-12}" 1 19 12)
 ZSTD_LONG=$(validate_int_range "ZSTD_LONG" "${ZSTD_LONG:-27}" 10 27 27)
+ZSTD_DEC_LONG=$(zstd_decode_long "$ZSTD_LONG")
 MIN_FREE_GB=$(validate_int_range "MIN_FREE_GB" "${MIN_FREE_GB:-5}" 1 1000 5)
 
 DAILY_MODE=false
@@ -123,6 +124,8 @@ is_month_failed() {
 # (cross-device fallback to cp -p), holding public.lock only for the directory scan/link.
 snapshot_month_files() {
     local month=$1 snap_dir=$2
+    local scan_list rc=0 scan_rc=0 fn
+
     exec 7>>"$PUBLIC_LOCK"
     if ! flock -w "$COMPRESS_LOCK_WAIT" 7; then
         echo "ERROR: public.lock still held after ${COMPRESS_LOCK_WAIT}s ($(lock_holder "$PUBLIC_LOCK"))."
@@ -131,19 +134,160 @@ snapshot_month_files() {
     fi
     note_lock_holder "$PUBLIC_LOCK"
     clean_stage_dir "$STAGE_DIR"
+    clean_publish_temps "$PUBLIC_DIR"
 
+    scan_list=$(mktemp "$(dirname "$snap_dir")/.aroi-tmp.scan.XXXXXX") || { exec 7>&-; return 1; }
     if [[ -d "$PUBLIC_DIR" ]]; then
-        (
-            cd "$PUBLIC_DIR"
-            find . -maxdepth 1 -name "aroi_validation_${month}*.json" -type f -size +0c 2>/dev/null \
-                | sed 's|^\./||' \
-                | { grep -E "^aroi_validation_${month}[0-9]{2}_[0-9]{6}\.json$" || true; } \
-                | while IFS= read -r fn; do
-                    ln "$PUBLIC_DIR/$fn" "$snap_dir/$fn" 2>/dev/null || cp -p "$PUBLIC_DIR/$fn" "$snap_dir/$fn"
-                done
-        )
+        if ! (
+            cd "$PUBLIC_DIR" || exit 1
+            find . -maxdepth 1 -name "aroi_validation_${month}*.json" -type f -size +0c > "$scan_list"
+        ); then
+            scan_rc=1
+        fi
+        if [[ $scan_rc -ne 0 ]]; then
+            echo "  ✗ Failed scanning $PUBLIC_DIR for $month"
+            rm -f "$scan_list"
+            exec 7>&-
+            return 1
+        fi
+        while IFS= read -r fn; do
+            fn=${fn#./}
+            [[ "$fn" =~ ^aroi_validation_${month}[0-9]{2}_[0-9]{6}\.json$ ]] || continue
+            if ! ln "$PUBLIC_DIR/$fn" "$snap_dir/$fn" 2>/dev/null && ! cp -p "$PUBLIC_DIR/$fn" "$snap_dir/$fn"; then
+                echo "  ✗ Failed snapshotting $fn for $month"
+                rc=1
+                break
+            fi
+        done < "$scan_list"
     fi
+
+    rm -f "$scan_list"
     exec 7>&-
+    return "$rc"
+}
+
+# Recover missing monthly members into snap_dir from verified remote _backups/aroi-YYYYMM.tar.zst.
+# When recover_all_if_present=true (e.g., local .list missing while local archive corrupt), recovers
+# all canonical members from an existing remote archive and fails if present remote backups fail checks.
+recover_remote_archive() {
+    local month=$1 want_file=$2 snap_dir=$3 work_dir=$4 recover_all_if_present=${5:-false}
+    local still_missing="$work_dir/recover-missing-${month}.txt"
+    if [[ -s "$want_file" ]]; then
+        LC_ALL=C sort -u "$want_file" > "$still_missing"
+    else
+        : > "$still_missing"
+    fi
+
+    if [[ "$NO_UPLOAD" == "true" ]] || [[ "$DO_ENABLED" != "true" && "$R2_ENABLED" != "true" ]]; then
+        [[ "$recover_all_if_present" != "true" && ! -s "$still_missing" ]] && return 0
+        return 1
+    fi
+
+    local -a providers=()
+    local -a buckets=()
+    local b
+    if [[ "$DO_ENABLED" == "true" ]] && b=$(resolve_do_bucket); then
+        providers+=("DO"); buckets+=("$b")
+    fi
+    if [[ "$R2_ENABLED" == "true" ]] && b=$(resolve_r2_bucket); then
+        providers+=("R2"); buckets+=("$b")
+    fi
+    if (( ${#providers[@]} == 0 )); then
+        [[ "$recover_all_if_present" != "true" && ! -s "$still_missing" ]] && return 0
+        return 1
+    fi
+
+    local archive_name="aroi-${month}.tar.zst"
+    local remote_seen=false remote_verified=false idx prov bucket
+    local dl_dir ext_dir lsf_out rem_members to_ext rc fn
+
+    for idx in "${!providers[@]}"; do
+        prov="${providers[$idx]}"
+        bucket="${buckets[$idx]}"
+        if [[ "$recover_all_if_present" != "true" && ! -s "$still_missing" ]]; then
+            break
+        fi
+
+        if ! lsf_out=$("$RCLONE" lsf "$bucket/_backups/" --max-depth 1 --files-only --include "$archive_name" 2>/dev/null); then
+            remote_seen=true
+            continue
+        fi
+        [[ -n "$lsf_out" ]] || continue
+        remote_seen=true
+
+        dl_dir=$(mktemp -d "$work_dir/recover-${prov}-${month}.XXXXXX")
+        printf '%s\n' "$archive_name" > "$dl_dir/want.txt"
+        if ! "$RCLONE" copy "$bucket/_backups" "$dl_dir" --files-from "$dl_dir/want.txt" --no-traverse >/dev/null 2>&1; then
+            rm -rf "$dl_dir"
+            continue
+        fi
+        if [[ ! -s "$dl_dir/$archive_name" ]] \
+            || ! zstd -t --long="$ZSTD_DEC_LONG" "$dl_dir/$archive_name" >/dev/null 2>&1 \
+            || ! list_archive_members "$dl_dir/$archive_name" "$dl_dir/all_members.txt"; then
+            rm -rf "$dl_dir"
+            continue
+        fi
+
+        rem_members="$dl_dir/members.txt"
+        grep -E "^aroi_validation_${month}[0-9]{2}_[0-9]{6}\.json$" "$dl_dir/all_members.txt" \
+            | LC_ALL=C sort -u > "$rem_members" || true
+
+        to_ext="$dl_dir/to_extract.txt"
+        if [[ "$recover_all_if_present" == "true" ]]; then
+            list_nonempty_validation_files "$snap_dir" > "$dl_dir/have.txt"
+            comm -23 "$rem_members" "$dl_dir/have.txt" > "$to_ext"
+            if [[ -s "$want_file" ]]; then
+                comm -12 "$still_missing" "$rem_members" >> "$to_ext"
+                LC_ALL=C sort -u "$to_ext" -o "$to_ext"
+            fi
+        else
+            comm -12 "$still_missing" "$rem_members" > "$to_ext"
+        fi
+
+        if [[ -s "$to_ext" ]]; then
+            ext_dir="$dl_dir/ext"
+            mkdir -p "$ext_dir"
+            rc=0
+            zstd -dc --long="$ZSTD_DEC_LONG" "$dl_dir/$archive_name" 2>/dev/null \
+                | tar -C "$ext_dir" -xf - -T "$to_ext" 2>/dev/null || rc=$?
+            if [[ $rc -ne 0 ]]; then
+                rm -rf "$dl_dir"
+                continue
+            fi
+            local all_ok=true
+            while IFS= read -r fn; do
+                [[ -z "$fn" ]] && continue
+                if [[ ! -s "$ext_dir/$fn" ]]; then
+                    all_ok=false
+                    break
+                fi
+            done < "$to_ext"
+            if [[ "$all_ok" != "true" ]]; then
+                rm -rf "$dl_dir"
+                continue
+            fi
+            while IFS= read -r fn; do
+                [[ -z "$fn" ]] && continue
+                mv -f "$ext_dir/$fn" "$snap_dir/$fn"
+            done < "$to_ext"
+            echo "  Recovered $(wc -l < "$to_ext" | tr -d '[:space:]') member(s) for $month from $prov backup"
+        fi
+
+        remote_verified=true
+        rm -rf "$dl_dir"
+
+        list_nonempty_validation_files "$snap_dir" > "$work_dir/snap-now.txt"
+        comm -23 "$still_missing" "$work_dir/snap-now.txt" > "$work_dir/still-next.txt"
+        mv -f "$work_dir/still-next.txt" "$still_missing"
+    done
+
+    if [[ -s "$still_missing" ]]; then
+        return 1
+    fi
+    if [[ "$recover_all_if_present" == "true" && "$remote_seen" == "true" && "$remote_verified" != "true" ]]; then
+        return 1
+    fi
+    return 0
 }
 
 # Build and verify local-archive/aroi-YYYYMM.tar.zst and aroi-YYYYMM.list.
@@ -166,28 +310,80 @@ archive_month() {
         return 1
     fi
 
+    list_nonempty_validation_files "$snap_dir" > "$work_dir/snap.txt"
+    if [[ -s "$list_path" ]]; then
+        grep -E "^aroi_validation_${month}[0-9]{2}_[0-9]{6}\.json$" "$list_path" 2>/dev/null \
+            | LC_ALL=C sort -u > "$work_dir/prev_list.txt" || true
+    else
+        : > "$work_dir/prev_list.txt"
+    fi
+
+    local archive_valid=false rc fn
+    : > "$work_dir/archive_members.txt"
+
     # Preserve any previously archived members not currently in public/
-    if [[ -s "$archive_path" ]]; then
-        if zstd -t "$archive_path" >/dev/null 2>&1; then
-            list_nonempty_validation_files "$snap_dir" > "$work_dir/snap.txt"
-            zstd -dc --long="$ZSTD_LONG" "$archive_path" | tar tf - 2>/dev/null \
-                | grep -E "^aroi_validation_${month}[0-9]{2}_[0-9]{6}\.json$" \
+    if [[ -e "$archive_path" ]]; then
+        if [[ -s "$archive_path" ]] \
+            && zstd -t --long="$ZSTD_DEC_LONG" "$archive_path" >/dev/null 2>&1 \
+            && list_archive_members "$archive_path" "$work_dir/archive_members.txt"; then
+            archive_valid=true
+            grep -E "^aroi_validation_${month}[0-9]{2}_[0-9]{6}\.json$" "$work_dir/archive_members.txt" \
                 | LC_ALL=C sort -u > "$work_dir/existing.txt" || true
             comm -23 "$work_dir/existing.txt" "$work_dir/snap.txt" > "$work_dir/missing_from_snap.txt"
             if [[ -s "$work_dir/missing_from_snap.txt" ]]; then
+                local ext_dir="$work_dir/existing-ext"
+                mkdir -p "$ext_dir"
                 echo "  Restoring $(wc -l < "$work_dir/missing_from_snap.txt" | tr -d '[:space:]') previously archived file(s) for $month"
-                if ! zstd -dc --long="$ZSTD_LONG" "$archive_path" | tar -C "$snap_dir" -xf - -T "$work_dir/missing_from_snap.txt"; then
+                rc=0
+                zstd -dc --long="$ZSTD_DEC_LONG" "$archive_path" 2>/dev/null \
+                    | tar -C "$ext_dir" -xf - -T "$work_dir/missing_from_snap.txt" 2>/dev/null || rc=$?
+                if [[ $rc -ne 0 ]]; then
                     echo "  ✗ Failed extracting existing members from $archive_name"
                     rm -rf "$work_dir"
                     return 1
                 fi
+                while IFS= read -r fn; do
+                    [[ -z "$fn" ]] && continue
+                    if [[ ! -s "$ext_dir/$fn" ]]; then
+                        echo "  ✗ Extracted empty or missing member $fn from $archive_name"
+                        rm -rf "$work_dir"
+                        return 1
+                    fi
+                    mv -f "$ext_dir/$fn" "$snap_dir/$fn"
+                done < "$work_dir/missing_from_snap.txt"
             fi
         else
-            echo "  ⚠ Existing $archive_name failed zstd -t; rebuilding from public/"
+            echo "  ⚠ Existing $archive_name failed integrity/listing check"
+            comm -23 "$work_dir/prev_list.txt" "$work_dir/snap.txt" > "$work_dir/lost_members.txt"
+            if [[ -s "$work_dir/lost_members.txt" ]]; then
+                if ! recover_remote_archive "$month" "$work_dir/lost_members.txt" "$snap_dir" "$work_dir" "false"; then
+                    echo "  ✗ Cannot recover missing previously archived member(s) for $month; refusing partial rebuild"
+                    rm -rf "$work_dir"
+                    return 1
+                fi
+            elif [[ ! -s "$work_dir/prev_list.txt" ]]; then
+                if ! recover_remote_archive "$month" "$work_dir/lost_members.txt" "$snap_dir" "$work_dir" "true"; then
+                    echo "  ✗ Cannot verify/recover remote backup for $month after corrupt local archive"
+                    rm -rf "$work_dir"
+                    return 1
+                fi
+            fi
         fi
     fi
 
     list_nonempty_validation_files "$snap_dir" > "$work_dir/expected.txt"
+
+    # Guard against any manifest-recorded member missing from both snap_dir and valid local tar
+    comm -23 "$work_dir/prev_list.txt" "$work_dir/expected.txt" > "$work_dir/still_missing.txt"
+    if [[ -s "$work_dir/still_missing.txt" ]]; then
+        if ! recover_remote_archive "$month" "$work_dir/still_missing.txt" "$snap_dir" "$work_dir" "false"; then
+            echo "  ✗ Local $list_name lists $(wc -l < "$work_dir/still_missing.txt" | tr -d '[:space:]') member(s) absent from snapshot and recovery"
+            rm -rf "$work_dir"
+            return 1
+        fi
+        list_nonempty_validation_files "$snap_dir" > "$work_dir/expected.txt"
+    fi
+
     if [[ ! -s "$work_dir/expected.txt" ]]; then
         rm -rf "$work_dir"
         return 0
@@ -196,9 +392,9 @@ archive_month() {
     local file_count
     file_count=$(wc -l < "$work_dir/expected.txt" | tr -d '[:space:]')
 
-    if [[ -s "$archive_path" && -s "$list_path" ]] \
-        && cmp -s "$work_dir/expected.txt" "$list_path" \
-        && zstd -t "$archive_path" >/dev/null 2>&1; then
+    if [[ "$archive_valid" == "true" && -s "$archive_path" && -s "$list_path" ]] \
+        && cmp -s "$work_dir/expected.txt" "$work_dir/archive_members.txt" \
+        && cmp -s "$work_dir/expected.txt" "$list_path"; then
         echo "  ✓ $archive_name already current ($file_count files)"
         ARCHIVED_MONTHS+=("$month")
         rm -rf "$work_dir"
@@ -207,21 +403,22 @@ archive_month() {
 
     echo "Processing month $month ($file_count files)..."
     local tmp_archive="$work_dir/$archive_name"
-    if ! tar cf - -C "$snap_dir" -T "$work_dir/expected.txt" \
-        | zstd -T0 "-${ZSTD_LEVEL}" "--long=${ZSTD_LONG}" -q -o "$tmp_archive"; then
+    rc=0
+    tar cf - -C "$snap_dir" -T "$work_dir/expected.txt" \
+        | zstd -T0 "-${ZSTD_LEVEL}" "--long=${ZSTD_LONG}" -q -o "$tmp_archive" || rc=$?
+    if [[ $rc -ne 0 ]]; then
         echo "  ✗ zstd compression failed for $month"
         rm -rf "$work_dir"
         return 1
     fi
 
-    if ! zstd -t "$tmp_archive" >/dev/null 2>&1; then
+    if ! zstd -t --long="$ZSTD_DEC_LONG" "$tmp_archive" >/dev/null 2>&1; then
         echo "  ✗ zstd integrity verification failed for $archive_name"
         rm -rf "$work_dir"
         return 1
     fi
 
-    if ! zstd -dc --long="$ZSTD_LONG" "$tmp_archive" | tar tf - 2>/dev/null \
-        | LC_ALL=C sort -u > "$work_dir/actual.txt"; then
+    if ! list_archive_members "$tmp_archive" "$work_dir/actual.txt"; then
         echo "  ✗ tar listing verification failed for $archive_name"
         rm -rf "$work_dir"
         return 1
@@ -233,9 +430,13 @@ archive_month() {
         return 1
     fi
 
-    chmod 644 "$tmp_archive" "$work_dir/expected.txt"
-    mv -f "$tmp_archive" "$archive_path"
-    mv -f "$work_dir/expected.txt" "$list_path"
+    if ! atomic_install_file "$tmp_archive" "$archive_path" 644 \
+        || ! atomic_install_file "$work_dir/expected.txt" "$list_path" 644; then
+        echo "  ✗ Failed installing $archive_name or $list_name"
+        rm -rf "$work_dir"
+        return 1
+    fi
+
     local archive_size
     archive_size=$(du -sh "$archive_path" 2>/dev/null | cut -f1) || archive_size="?"
     echo "  ✓ Archived $file_count files → $archive_name ($archive_size)"
@@ -244,9 +445,9 @@ archive_month() {
     return 0
 }
 
-# List top-level non-empty live JSONs and _backups/ artifacts once per provider.
+# List top-level live JSONs (non-empty and 0-byte separately) and _backups/ (with MD5) per provider.
 fetch_remote_state() {
-    local provider=$1 bucket=$2 out_live=$3 out_backups=$4
+    local provider=$1 bucket=$2 out_live=$3 out_zero=$4 out_backups=$5
     local raw_live="${out_live}.raw" raw_bk="${out_backups}.raw"
     echo "Listing remote state for $provider ($bucket)..."
     if ! "$RCLONE" lsf "$bucket" --max-depth 1 --files-only --format sp > "$raw_live" 2>/dev/null; then
@@ -255,8 +456,9 @@ fetch_remote_state() {
         return 1
     fi
     awk -F';' '$1+0 > 0 {print $2}' "$raw_live" | { grep -E "$AROI_JSON_REGEX" || true; } | LC_ALL=C sort -u > "$out_live"
+    awk -F';' '$1+0 == 0 {print $2}' "$raw_live" | { grep -E "$AROI_JSON_REGEX" || true; } | LC_ALL=C sort -u > "$out_zero"
 
-    if ! "$RCLONE" lsf "$bucket/_backups/" --max-depth 1 --files-only --format sp > "$raw_bk" 2>/dev/null; then
+    if ! "$RCLONE" lsf "$bucket/_backups/" --max-depth 1 --files-only --format shp > "$raw_bk" 2>/dev/null; then
         echo "  ✗ Failed listing _backups/ in $bucket"
         rm -f "$raw_live" "$raw_bk"
         return 1
@@ -266,20 +468,22 @@ fetch_remote_state() {
     return 0
 }
 
-# Verify a completed month has 100% live files (backfilling from public/ if needed)
-# and matching _backups/aroi-YYYYMM.tar.zst byte size on a provider.
+# Verify a completed month has 100% non-empty live files (backfilling absent keys with
+# --ignore-existing and replacing confirmed 0-byte keys from public/) and matching
+# _backups/aroi-YYYYMM.{tar.zst,list} pairs on a provider.
 verify_completed_month_provider() {
-    local provider=$1 bucket=$2 month=$3 list_file=$4 local_zst_size=$5
-    local remote_live=$6 remote_backups=$7 work_dir=$8
+    local provider=$1 bucket=$2 month=$3 list_file=$4
+    local remote_live=$5 remote_zero=$6 remote_backups=$7 work_dir=$8
     local missing_file="$work_dir/missing-${provider}-${month}.txt"
 
     comm -23 "$list_file" "$remote_live" > "$missing_file"
     if [[ -s "$missing_file" ]]; then
         local missing_count
         missing_count=$(wc -l < "$missing_file" | tr -d '[:space:]')
-        echo "  ⚠ $provider missing $missing_count live file(s) for $month; attempting backfill from public/..."
+        echo "  ⚠ $provider missing $missing_count non-empty live file(s) for $month; attempting backfill from public/..."
         local can_backfill="$work_dir/backfill-${provider}-${month}.txt"
         : > "$can_backfill"
+        local fn
         while IFS= read -r fn; do
             [[ -s "$PUBLIC_DIR/$fn" ]] && echo "$fn" >> "$can_backfill"
         done < "$missing_file"
@@ -288,10 +492,27 @@ verify_completed_month_provider() {
             echo "  ✗ Cannot backfill all missing files from public/ for $provider ($month)"
             return 1
         fi
-        if ! "$RCLONE" copy "$PUBLIC_DIR" "$bucket" --files-from "$can_backfill" --no-traverse --ignore-existing >/dev/null 2>&1; then
-            echo "  ✗ Backfill upload failed for $provider ($month)"
-            return 1
+        LC_ALL=C sort -u "$can_backfill" -o "$can_backfill"
+
+        local replace_zero="$work_dir/backfill-zero-${provider}-${month}.txt"
+        local append_absent="$work_dir/backfill-absent-${provider}-${month}.txt"
+        comm -12 "$can_backfill" "$remote_zero" > "$replace_zero"
+        comm -23 "$can_backfill" "$remote_zero" > "$append_absent"
+
+        if [[ -s "$append_absent" ]]; then
+            if ! "$RCLONE" copy "$PUBLIC_DIR" "$bucket" --files-from "$append_absent" --no-traverse --ignore-existing >/dev/null 2>&1; then
+                echo "  ✗ Backfill upload failed for $provider ($month)"
+                return 1
+            fi
         fi
+        if [[ -s "$replace_zero" ]]; then
+            echo "  ↻ Replacing $(wc -l < "$replace_zero" | tr -d '[:space:]') confirmed 0-byte object(s) in $provider ($month)..."
+            if ! "$RCLONE" copy "$PUBLIC_DIR" "$bucket" --files-from "$replace_zero" --no-traverse >/dev/null 2>&1; then
+                echo "  ✗ Zero-byte replacement upload failed for $provider ($month)"
+                return 1
+            fi
+        fi
+
         # Re-verify backfilled non-empty files now exist live remotely
         local raw_recheck recheck
         if ! raw_recheck=$("$RCLONE" lsf "$bucket" --max-depth 1 --files-only --format sp --include "aroi_validation_${month}*.json" 2>/dev/null); then
@@ -305,25 +526,14 @@ verify_completed_month_provider() {
         fi
     fi
 
-    # Verify _backups/aroi-YYYYMM.tar.zst size and aroi-YYYYMM.list presence
-    local remote_zst_size
-    remote_zst_size=$(awk -F';' -v name="aroi-${month}.tar.zst" '$2 == name {print $1}' "$remote_backups")
-    if [[ -z "$remote_zst_size" ]] || [[ "$remote_zst_size" != "$local_zst_size" ]]; then
-        echo "  ✗ $provider _backups/aroi-${month}.tar.zst size mismatch (local=${local_zst_size}, remote=${remote_zst_size:-missing})"
-        return 1
-    fi
-    if ! grep -qE "^[1-9][0-9]*;aroi-${month}\.list$" "$remote_backups"; then
-        echo "  ✗ $provider _backups/aroi-${month}.list missing or empty"
-        return 1
-    fi
-
+    verify_remote_backup_pair "$RCLONE" "$provider" "$bucket" "$month" "$ARCHIVE_DIR" "$remote_backups" "$work_dir" || return 1
     return 0
 }
 
 # Safely remove uncompressed files for a verified completed month from public/.
 prune_completed_month_local() {
     local month=$1 list_file=$2
-    local removed=0
+    local removed=0 failed=0 fn manifest_rc=0
 
     exec 7>>"$PUBLIC_LOCK"
     if ! flock -w "$COMPRESS_LOCK_WAIT" 7; then
@@ -336,13 +546,22 @@ prune_completed_month_local() {
     while IFS= read -r fn; do
         [[ "$fn" =~ ^aroi_validation_${month}[0-9]{2}_[0-9]{6}\.json$ ]] || continue
         if [[ -e "$PUBLIC_DIR/$fn" ]]; then
-            rm -f "$PUBLIC_DIR/$fn"
-            removed=$((removed + 1))
+            if rm -f "$PUBLIC_DIR/$fn"; then
+                removed=$((removed + 1))
+            else
+                echo "  ✗ Failed removing $PUBLIC_DIR/$fn"
+                failed=$((failed + 1))
+            fi
         fi
     done < "$list_file"
 
-    build_files_manifest "$PUBLIC_DIR" "$ARCHIVE_DIR" "$STAGE_DIR"
+    build_files_manifest "$PUBLIC_DIR" "$ARCHIVE_DIR" "$STAGE_DIR" || manifest_rc=$?
     exec 7>&-
+
+    if (( failed > 0 )) || [[ $manifest_rc -ne 0 ]]; then
+        echo "  ✗ Local cleanup incomplete for $month (removed=$removed, failed=$failed, manifest_rc=$manifest_rc)"
+        return 1
+    fi
 
     echo "  ✓ Verified 3 copies and removed $removed uncompressed file(s) from public/ for $month"
     return 0
@@ -399,15 +618,13 @@ if [[ "$NO_UPLOAD" != "true" ]] && [[ ${#COMPLETED_CANDIDATES[@]} -gt 0 ]]; then
         VERIFY_WORK=$(mktemp -d "$STAGE_DIR/verify-archive.XXXXXX")
         REMOTE_OK=true
         if [[ "$DO_ENABLED" == "true" ]]; then
-            DO_BUCKET="${AROI_DO_REMOTE:-aroi-spaces}:${DO_SPACES_BUCKET:?}"
-            if ! fetch_remote_state "DO" "$DO_BUCKET" "$VERIFY_WORK/do-live.txt" "$VERIFY_WORK/do-backups.txt"; then
+            if ! DO_BUCKET=$(resolve_do_bucket) || ! fetch_remote_state "DO" "$DO_BUCKET" "$VERIFY_WORK/do-live.txt" "$VERIFY_WORK/do-zero.txt" "$VERIFY_WORK/do-backups.txt"; then
                 REMOTE_OK=false
                 ERRORS=$((ERRORS + 1))
             fi
         fi
         if [[ "$R2_ENABLED" == "true" ]]; then
-            R2_BUCKET_URI="${AROI_R2_REMOTE:-aroi-r2}:${R2_BUCKET:?}"
-            if ! fetch_remote_state "R2" "$R2_BUCKET_URI" "$VERIFY_WORK/r2-live.txt" "$VERIFY_WORK/r2-backups.txt"; then
+            if ! R2_BUCKET_URI=$(resolve_r2_bucket) || ! fetch_remote_state "R2" "$R2_BUCKET_URI" "$VERIFY_WORK/r2-live.txt" "$VERIFY_WORK/r2-zero.txt" "$VERIFY_WORK/r2-backups.txt"; then
                 REMOTE_OK=false
                 ERRORS=$((ERRORS + 1))
             fi
@@ -418,23 +635,25 @@ if [[ "$NO_UPLOAD" != "true" ]] && [[ ${#COMPLETED_CANDIDATES[@]} -gt 0 ]]; then
                 is_month_failed "$MONTH" && continue
                 ARCHIVE_PATH="$ARCHIVE_DIR/aroi-${MONTH}.tar.zst"
                 LIST_PATH="$ARCHIVE_DIR/aroi-${MONTH}.list"
-                if [[ ! -s "$ARCHIVE_PATH" || ! -s "$LIST_PATH" ]] || ! zstd -t "$ARCHIVE_PATH" >/dev/null 2>&1; then
+                if [[ ! -s "$ARCHIVE_PATH" || ! -s "$LIST_PATH" ]] \
+                    || ! zstd -t --long="$ZSTD_DEC_LONG" "$ARCHIVE_PATH" >/dev/null 2>&1 \
+                    || ! list_archive_members "$ARCHIVE_PATH" "$VERIFY_WORK/local-members-${MONTH}.txt" \
+                    || ! cmp -s "$LIST_PATH" "$VERIFY_WORK/local-members-${MONTH}.txt"; then
                     echo "  ✗ Local verification failed for $MONTH; keeping files in public/"
                     ERRORS=$((ERRORS + 1))
                     continue
                 fi
-                LOCAL_ZST_SIZE=$(file_size_bytes "$ARCHIVE_PATH")
 
                 MONTH_VERIFIED=true
                 if [[ "$DO_ENABLED" == "true" ]]; then
-                    if ! verify_completed_month_provider "DO" "$DO_BUCKET" "$MONTH" "$LIST_PATH" "$LOCAL_ZST_SIZE" \
-                        "$VERIFY_WORK/do-live.txt" "$VERIFY_WORK/do-backups.txt" "$VERIFY_WORK"; then
+                    if ! verify_completed_month_provider "DO" "$DO_BUCKET" "$MONTH" "$LIST_PATH" \
+                        "$VERIFY_WORK/do-live.txt" "$VERIFY_WORK/do-zero.txt" "$VERIFY_WORK/do-backups.txt" "$VERIFY_WORK"; then
                         MONTH_VERIFIED=false
                     fi
                 fi
                 if [[ "$R2_ENABLED" == "true" && "$MONTH_VERIFIED" == "true" ]]; then
-                    if ! verify_completed_month_provider "R2" "$R2_BUCKET_URI" "$MONTH" "$LIST_PATH" "$LOCAL_ZST_SIZE" \
-                        "$VERIFY_WORK/r2-live.txt" "$VERIFY_WORK/r2-backups.txt" "$VERIFY_WORK"; then
+                    if ! verify_completed_month_provider "R2" "$R2_BUCKET_URI" "$MONTH" "$LIST_PATH" \
+                        "$VERIFY_WORK/r2-live.txt" "$VERIFY_WORK/r2-zero.txt" "$VERIFY_WORK/r2-backups.txt" "$VERIFY_WORK"; then
                         MONTH_VERIFIED=false
                     fi
                 fi
@@ -456,34 +675,43 @@ fi
 # === Step 4: Compress cron.log (if > 50 MB, monthly / non-daily mode) ===
 if [[ "$DAILY_MODE" != "true" ]] && [[ -f "$LOG_DIR/cron.log" ]]; then
     echo "Checking cron.log size..."
-    LOG_SIZE=$(file_size_bytes "$LOG_DIR/cron.log" || echo 0)
-    [[ "$LOG_SIZE" =~ ^[0-9]+$ ]] || LOG_SIZE=0
-    LOG_SIZE_MB=$((LOG_SIZE / 1048576))
+    CRON_LOG_LOCK="$LOG_DIR/cron-log.lock"
+    exec 6>>"$CRON_LOG_LOCK"
+    if flock -x -w 300 6; then
+        note_lock_holder "$CRON_LOG_LOCK"
+        LOG_SIZE=$(file_size_bytes "$LOG_DIR/cron.log" || echo 0)
+        [[ "$LOG_SIZE" =~ ^[0-9]+$ ]] || LOG_SIZE=0
+        LOG_SIZE_MB=$((LOG_SIZE / 1048576))
 
-    if (( LOG_SIZE_MB > 50 )); then
-        DATE_PART=$(date +%Y-%m)
-        LOG_ARCHIVE_NAME="cron-${DATE_PART}.log.zst"
-        if [[ -e "$LOG_DIR/archives/$LOG_ARCHIVE_NAME" ]]; then
-            LOG_ARCHIVE_NAME="cron-$(date +%Y-%m-%d_%H%M%S).log.zst"
-        fi
-        TMP_LOG_ZST=$(mktemp "$STAGE_DIR/cron-log.XXXXXX")
-        echo "cron.log is ${LOG_SIZE_MB}MB, compressing with zstd..."
-        if zstd -T0 "-${ZSTD_LEVEL}" -q -c "$LOG_DIR/cron.log" > "$TMP_LOG_ZST" && zstd -t "$TMP_LOG_ZST" >/dev/null 2>&1; then
-            chmod 644 "$TMP_LOG_ZST"
-            mv -f "$TMP_LOG_ZST" "$LOG_DIR/archives/$LOG_ARCHIVE_NAME"
-            # Truncate in place so a running batch keeps appending to the open inode
-            TEMP_TAIL=$(mktemp "$LOG_DIR/cron.log.XXXXXX")
-            tail -500 "$LOG_DIR/cron.log" > "$TEMP_TAIL" || true
-            cat "$TEMP_TAIL" > "$LOG_DIR/cron.log"
-            rm -f "$TEMP_TAIL"
-            echo "  ✓ Compressed to $LOG_ARCHIVE_NAME"
+        if (( LOG_SIZE_MB > 50 )); then
+            DATE_PART=$(date +%Y-%m)
+            LOG_ARCHIVE_NAME="cron-${DATE_PART}.log.zst"
+            if [[ -e "$LOG_DIR/archives/$LOG_ARCHIVE_NAME" ]]; then
+                LOG_ARCHIVE_NAME="cron-$(date +%Y-%m-%d_%H%M%S).log.zst"
+            fi
+            LOG_WORK=$(mktemp -d "$LOG_DIR/archives/.aroi-logwork.XXXXXX")
+            TMP_LOG_ZST="$LOG_WORK/$LOG_ARCHIVE_NAME"
+            echo "cron.log is ${LOG_SIZE_MB}MB, compressing with zstd..."
+            if zstd -T0 "-${ZSTD_LEVEL}" -q -c "$LOG_DIR/cron.log" > "$TMP_LOG_ZST" && zstd -t "$TMP_LOG_ZST" >/dev/null 2>&1; then
+                chmod 644 "$TMP_LOG_ZST"
+                mv -f "$TMP_LOG_ZST" "$LOG_DIR/archives/$LOG_ARCHIVE_NAME"
+                # Truncate in place under exclusive cron-log.lock so no batch append is lost
+                tail -n 500 "$LOG_DIR/cron.log" > "$LOG_WORK/tail.log" || true
+                cat "$LOG_WORK/tail.log" > "$LOG_DIR/cron.log"
+                echo "  ✓ Compressed to $LOG_ARCHIVE_NAME"
+            else
+                echo "  ✗ cron.log zstd compression failed"
+                ERRORS=$((ERRORS + 1))
+            fi
+            rm -rf "$LOG_WORK"
         else
-            echo "  ✗ cron.log zstd compression failed"
-            rm -f "$TMP_LOG_ZST"
-            ERRORS=$((ERRORS + 1))
+            echo "cron.log is ${LOG_SIZE_MB}MB (under 50MB threshold)"
         fi
+        exec 6>&-
     else
-        echo "cron.log is ${LOG_SIZE_MB}MB (under 50MB threshold)"
+        exec 6>&-
+        echo "ERROR: cron-log.lock busy after 300s; skipping cron.log rotation"
+        ERRORS=$((ERRORS + 1))
     fi
 fi
 
@@ -492,7 +720,7 @@ echo "Updating file manifest..."
 exec 7>>"$PUBLIC_LOCK"
 if flock -w "$COMPRESS_LOCK_WAIT" 7; then
     note_lock_holder "$PUBLIC_LOCK"
-    build_files_manifest "$PUBLIC_DIR" "$ARCHIVE_DIR" "$STAGE_DIR"
+    build_files_manifest "$PUBLIC_DIR" "$ARCHIVE_DIR" "$STAGE_DIR" || ERRORS=$((ERRORS + 1))
     exec 7>&-
 else
     exec 7>&-
@@ -501,7 +729,12 @@ else
 fi
 
 if (( ERRORS == 0 )); then
-    date '+%Y-%m-%d' > "$LOG_DIR/last-archive-date"
+    if [[ "$NO_UPLOAD" != "true" && -z "$TARGET_MONTH" ]]; then
+        TMP_MARKER=$(mktemp "$LOG_DIR/.aroi-tmp.date.XXXXXX")
+        date '+%Y-%m-%d' > "$TMP_MARKER"
+        chmod 644 "$TMP_MARKER"
+        mv -f "$TMP_MARKER" "$LOG_DIR/last-archive-date"
+    fi
     echo "Archival completed at $(date)"
     echo ""
     exit 0
