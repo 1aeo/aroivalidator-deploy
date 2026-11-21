@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # AROI Validator Hourly Batch - Validation + Cloud Upload
 # Uploads to DO Spaces (primary) and R2 (backup) in parallel
 #
@@ -14,9 +14,10 @@ source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 init_paths
 load_config || true
 
-CODE_DIR="$HOME/aroivalidator"
+CODE_DIR="${CODE_DIR:-$HOME/aroivalidator}"
 LOG_DIR="$DEPLOY_DIR/logs"
-WEB_DIR="$DEPLOY_DIR/public"
+WEB_DIR="${OUTPUT_DIR:-$DEPLOY_DIR/public}"
+ARCHIVE_DIR="${ARCHIVE_DIR:-$DEPLOY_DIR/local-archive}"
 STAGE_DIR="$DEPLOY_DIR/tmp"  # same filesystem as public/: files are renamed into place
 LOCK_FILE="$LOG_DIR/validation.lock"
 PUBLIC_LOCK="$LOG_DIR/public.lock"
@@ -24,9 +25,17 @@ GIT_TIMEOUT=300
 # Tags lines printed after the validation lock is released (they can interleave with the next run)
 RUN_TAG="batch $(date '+%H:%M:%S')"
 
-: "${CLOUD_UPLOAD:=true}" "${DO_ENABLED:=false}" "${R2_ENABLED:=false}"
+: "${CLOUD_UPLOAD:=true}" "${DO_ENABLED:=false}" "${R2_ENABLED:=false}" "${BATCH_QUIET:=true}"
 
-mkdir -p "$LOG_DIR" "$WEB_DIR" "$STAGE_DIR"
+mkdir -p "$LOG_DIR" "$WEB_DIR" "$ARCHIVE_DIR" "$STAGE_DIR"
+
+# Hold a shared lock across this batch's log output so monthly cron.log rotation
+# in compress-old-data.sh waits until no batch run can append mid-truncate.
+CRON_LOG_LOCK="$LOG_DIR/cron-log.lock"
+exec 6>>"$CRON_LOG_LOCK"
+if ! flock -s -w 300 6; then
+    echo "WARNING: cron-log.lock busy after 300s; continuing without log-rotation serialization" >&2
+fi
 
 # Atomic lock file to prevent concurrent runs (race-condition safe)
 exec 9>>"$LOCK_FILE"
@@ -65,7 +74,7 @@ update_warning() {
 
 # Security: Only fetch/reset if remote URL is from expected source (case-insensitive)
 REMOTE_URL=$(git -C "$CODE_DIR" config --get remote.origin.url 2>/dev/null || echo "")
-REMOTE_URL_LOWER="${REMOTE_URL,,}"  # Convert to lowercase for comparison
+REMOTE_URL_LOWER=$(printf '%s' "$REMOTE_URL" | tr '[:upper:]' '[:lower:]')
 if [[ "$REMOTE_URL_LOWER" == *"github.com/1aeo/aroivalidator"* || "$REMOTE_URL_LOWER" == *"github.com:1aeo/aroivalidator"* ]]; then
     rc=0
     out=$(GIT_TERMINAL_PROMPT=0 timeout "$GIT_TIMEOUT" git -C "$CODE_DIR" fetch origin main 2>&1) || rc=$?
@@ -98,13 +107,17 @@ fi
 # and CPU: say so, to tell dips in this hour's results from code regressions. Only reads
 # the lock files (no flock), so it cannot delay or skip anything.
 for provider in "DO" "R2"; do
-    if lock_pid_alive "$LOG_DIR/upload-${provider,,}.lock"; then
+    provider_lower=$(printf '%s' "$provider" | tr '[:upper:]' '[:lower:]')
+    if lock_pid_alive "$LOG_DIR/upload-${provider_lower}.lock"; then
         echo "Note: validating while $provider upload (pid $LOCK_PID, since $LOCK_SINCE) is still running"
     fi
 done
 
 cd "$CODE_DIR"
-source venv/bin/activate
+if [[ -f venv/bin/activate ]]; then
+    # shellcheck disable=SC1091
+    source venv/bin/activate
+fi
 
 # CIISS ContactInfo spec versions to validate. Default 2,3 = every version this
 # build of aroivalidator understands (v2 RSA-fingerprint + v3 ed25519 family-ID).
@@ -112,41 +125,68 @@ source venv/bin/activate
 : "${CIISS_VERSIONS:=2,3}"
 
 echo "Running validation (ciissversions: ${CIISS_VERSIONS})..."
-BATCH_LIMIT=0 PARALLEL=true MAX_WORKERS=20 python3 aroi_cli.py batch \
+BATCH_LIMIT=0 PARALLEL=true MAX_WORKERS=20 BATCH_QUIET="$BATCH_QUIET" python3 aroi_cli.py batch \
     --ciiss-versions "$CIISS_VERSIONS" \
     || { echo "Validation failed"; exit 1; }
 
-# Copy into public/ via STAGE_DIR + rename: nothing in public/ is written in place,
-# so an upload's hard-link snapshot of it (see upload-common.sh) never changes
-publish_file() { cp "$1" "$STAGE_DIR/$2" && mv -f "$STAGE_DIR/$2" "$WEB_DIR/$2"; }
+# Stage directly on WEB_DIR's filesystem, set 0644, and atomically rename into place.
+publish_file() {
+    local src=$1 dest_name=$2 tmp
+    tmp=$(mktemp "$WEB_DIR/.aroi-tmp.XXXXXX") || return 1
+    if cp "$src" "$tmp" && chmod 644 "$tmp" && mv -f "$tmp" "$WEB_DIR/$dest_name"; then
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
+}
 
-# Publish results
+# Publish results into public/, keeping only latest.json in validation_results/
+# to prevent 25+ GiB duplicate storage and archive resurrection.
 SRC="$CODE_DIR/validation_results"
 if [[ -d "$SRC" ]]; then
     echo "Publishing..."
-    # Waits for compress-old-data.sh, which also rewrites public/
+    # Waits for compress-old-data.sh, which also accesses public/ briefly
     exec 7>>"$PUBLIC_LOCK"
     if flock -w "$PUBLIC_LOCK_WAIT" 7; then
         note_lock_holder "$PUBLIC_LOCK"
         clean_stage_dir "$STAGE_DIR"
-        rc=0
-        out=$(rsync -a --temp-dir="$STAGE_DIR" --include='*.json' --exclude='*' "$SRC/" "$WEB_DIR/" 2>&1) || rc=$?
-        if [[ $rc -ne 0 ]]; then
-            out=$(first_lines "$out")
-            echo "WARNING: publish rsync failed (exit $rc): ${out:-no output} - copying results newer than files.json instead"
-            while IFS= read -r -d '' f; do
-                publish_file "$f" "${f##*/}" || true
-            done < <(find "$SRC" -maxdepth 1 -name "*.json" -newer "$WEB_DIR/files.json" -print0 2>/dev/null)
+        clean_publish_temps "$WEB_DIR"
+
+        published_latest=""
+        while IFS= read -r -d '' f; do
+            base=${f##*/}
+            if [[ ! "$base" =~ $AROI_JSON_REGEX ]]; then
+                echo "WARNING: skipping unexpected result filename: $base"
+                continue
+            fi
+            if [[ ! -s "$f" ]]; then
+                echo "WARNING: skipping empty 0-byte result file: $base"
+                continue
+            fi
+            if [[ -s "$WEB_DIR/$base" ]] && cmp -s "$f" "$WEB_DIR/$base"; then
+                rm -f "$f"
+                published_latest="$base"
+            elif publish_file "$f" "$base" && [[ -s "$WEB_DIR/$base" ]]; then
+                rm -f "$f"
+                published_latest="$base"
+            else
+                echo "WARNING: failed to publish $base to $WEB_DIR"
+            fi
+        done < <(find "$SRC" -maxdepth 1 -name "aroi_validation_*.json" -type f -print0 2>/dev/null | LC_ALL=C sort -z)
+
+        if [[ -s "$SRC/latest.json" ]]; then
+            if publish_file "$SRC/latest.json" latest.json; then
+                latest_name=$(list_nonempty_validation_files "$WEB_DIR" | tail -1 || true)
+                echo "Latest: ${published_latest:-${latest_name:-latest.json}}"
+            fi
+        else
+            latest_name=$(list_nonempty_validation_files "$WEB_DIR" | tail -1 || true)
+            if [[ -n "$latest_name" && -s "$WEB_DIR/$latest_name" ]]; then
+                publish_file "$WEB_DIR/$latest_name" latest.json && echo "Latest: $latest_name"
+            fi
         fi
 
-        # Subshell disables pipefail to avoid SIGPIPE from head closing the pipe early
-        LATEST=$(set +o pipefail; ls -t "$SRC"/aroi_validation_*.json 2>/dev/null | head -1)
-        [[ -n "$LATEST" ]] && publish_file "$LATEST" latest.json && echo "Latest: $(basename "$LATEST")"
-
-        # File manifest (atomic write to prevent corruption)
-        find "$WEB_DIR" -maxdepth 1 -name "aroi_validation_*.json" -printf '%f\n' 2>/dev/null \
-            | sort -r | jq -Rs 'split("\n") | map(select(length > 0))' > "$STAGE_DIR/files.json" \
-            && mv -f "$STAGE_DIR/files.json" "$WEB_DIR/files.json"
+        build_files_manifest "$WEB_DIR" "$ARCHIVE_DIR" "$STAGE_DIR"
     else
         echo "WARNING: not publishing - public.lock still held after ${PUBLIC_LOCK_WAIT}s ($(lock_holder "$PUBLIC_LOCK")); the next run publishes this file"
     fi
@@ -160,7 +200,7 @@ exec 9>&-
 # Run one provider's upload; prints a single result line
 run_upload() {
     local name=$1 id=$2 rc=0 t0=$SECONDS
-    "$SCRIPT_DIR/upload-$id.sh" "$WEB_DIR" >> "$LOG_DIR/upload-$id.log" 2>&1 || rc=$?
+    "$SCRIPT_DIR/upload-$id.sh" "$WEB_DIR" >> "$LOG_DIR/upload-$id.log" 2>&1 6>&- || rc=$?
     case $rc in
         0) echo "✓ $name ($((SECONDS - t0))s) [$RUN_TAG]" ;;
         "$UPLOAD_SKIPPED") echo "↷ skipping $name upload: previous still running ($(lock_holder "$LOG_DIR/upload-$id.lock")) [$RUN_TAG]" ;;
@@ -189,9 +229,23 @@ if [[ "$CLOUD_UPLOAD" == "true" ]]; then
     else echo "✓ All uploads done [$RUN_TAG]"; fi
 fi
 
-# Prune old backups (non-fatal)
-if [[ -x "$SCRIPT_DIR/prune-backups.sh" ]]; then
-    "$SCRIPT_DIR/prune-backups.sh" >> "$LOG_DIR/prune.log" 2>&1 || true
+# Daily zstd backup archive refresh & completed-month cleanup (at most once per day)
+TODAY=$(date '+%Y-%m-%d')
+LAST_ARCHIVE_MARKER="$LOG_DIR/last-archive-date"
+LAST_ARCHIVE_ATTEMPT_MARKER="$LOG_DIR/last-archive-attempt-date"
+last_done=$(cat "$LAST_ARCHIVE_MARKER" 2>/dev/null || true)
+last_attempt=$(cat "$LAST_ARCHIVE_ATTEMPT_MARKER" 2>/dev/null || true)
+if [[ -x "$SCRIPT_DIR/compress-old-data.sh" && "$last_done" != "$TODAY" && "$last_attempt" != "$TODAY" ]]; then
+    tmp_attempt=$(mktemp "$LOG_DIR/.aroi-tmp.attempt.XXXXXX")
+    printf '%s\n' "$TODAY" > "$tmp_attempt"
+    chmod 644 "$tmp_attempt"
+    mv -f "$tmp_attempt" "$LAST_ARCHIVE_ATTEMPT_MARKER"
+    if "$SCRIPT_DIR/compress-old-data.sh" --daily >> "$LOG_DIR/compression.log" 2>&1 6>&-; then
+        echo "✓ Daily zstd archive up to date [$RUN_TAG]"
+    else
+        echo "⚠ Daily zstd archive failed (see logs/compression.log) [$RUN_TAG]"
+    fi
 fi
 
 echo "=== Complete $(date) [$RUN_TAG] ==="
+exec 6>&-

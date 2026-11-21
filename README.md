@@ -31,7 +31,7 @@ nano config.env
 
 ### Option 1: Cloudflare Pages (Default)
 
-Static frontend on Pages, JSON data on DO Spaces/R2.
+Static frontend on Pages, JSON data on DO Spaces and Cloudflare R2.
 
 **Required in config.env:**
 ```bash
@@ -46,6 +46,9 @@ R2_SECRET_ACCESS_KEY=xxx
 **Optional:**
 ```bash
 CIISS_VERSIONS=2,3         # CIISS spec versions to validate (default: 2,3)
+BATCH_QUIET=true           # Suppress per-relay progress lines in cron.log
+ZSTD_LEVEL=12              # Monthly zstd backup compression level (1-19)
+ZSTD_LONG=27               # Monthly zstd --long window exponent (10-27)
 ```
 
 **Deploy:**
@@ -67,24 +70,48 @@ sudo ./scripts/install.sh --caddy
 
 ---
 
-## Automation
+## Automation & Storage Model
+
+Every hourly validation result (`aroi_validation_YYYYMMDD_HHMMSS.json`) is kept
+available directly on the website from **both** DO Spaces and Cloudflare R2, and
+backed up in highly compressed monthly `zstd --long=27` archives (`aroi-YYYYMM.tar.zst`
++ `aroi-YYYYMM.list`) across local disk (`local-archive/`) and remote `_backups/`:
+
+| Location | Contents | Retention / Notes |
+|----------|----------|-------------------|
+| DO Spaces root | All uncompressed hourly JSONs + `latest.json` + `files.json` | Hourly JSONs: append-only `rclone copy --no-traverse --ignore-existing`; `latest.json` & `files.json`: copied separately without `--ignore-existing` |
+| Cloudflare R2 root | Identical copy of all hourly JSONs + `latest.json` + `files.json` | Hourly JSONs: append-only `rclone copy --no-traverse --ignore-existing`; `latest.json` & `files.json`: copied separately without `--ignore-existing` |
+| DO Spaces `_backups/` & R2 `_backups/` | `aroi-YYYYMM.tar.zst` + `aroi-YYYYMM.list` | Uploaded daily for current month, finalized on month rollover |
+| Local `local-archive/` | `aroi-YYYYMM.tar.zst` + `aroi-YYYYMM.list` | Complete compressed local history (~3.5 MiB/month) |
+| Local `public/` | `latest.json`, `files.json`, and current month's hourly JSONs | Completed months removed only after 3-copy verification |
+| `~/aroivalidator/validation_results/` | `latest.json` only | Published JSONs are moved into `public/` atomically |
 
 | Schedule | Task |
 |----------|------|
-| Hourly :05 | Validate relays, upload to cloud |
-| Monthly 1st | Compress data >180 days old |
+| Hourly (`run-batch-validation.sh`) | Validate relays, move new JSONs to `public/`, rebuild full `files.json`, append-only copy to DO/R2, refresh daily zstd archive once/day |
+| Monthly 1st 02:00 (`compress-old-data.sh`) | Archive/verify completed months, rotate `cron.log` (>50 MB) to `logs/archives/*.log.zst`, verify 3-copy parity before cleaning `public/` |
 
 ---
 
 ## Commands
 
 ```bash
-# Manual validation
+# Manual validation + upload
 ./scripts/run-batch-validation.sh
 
-# Upload to cloud
+# Append-only upload to cloud (or --full-copy / --upload-backups [YYYYMM])
 ./scripts/upload-do.sh
 ./scripts/upload-r2.sh
+
+# Build/refresh zstd monthly archives and verify completed-month cleanup
+./scripts/compress-old-data.sh
+
+# Verify parity across local-archive, public, DO Spaces, and R2 (add --fix to backfill)
+./scripts/verify-sync.sh
+./scripts/verify-sync.sh --verify-zstd
+
+# Clean legacy timestamped uncompressed backup directories (never touches aroi-*.tar.zst)
+./scripts/prune-backups.sh --dry-run
 
 # Deploy frontend
 ./scripts/pages-deploy.sh
@@ -99,28 +126,27 @@ tail -f logs/cron.log
 
 The hourly run holds `logs/validation.lock` only for the code update, validation
 and publishing to `public/` (about a minute). Uploads start after it is released,
-each under its own provider lock, so a slow upload (e.g. the daily backups in the
-first upload of the day) no longer makes the next hour skip validation or the
-code update.
+each under its own provider lock using per-provider ledgers (`logs/uploaded-do.txt`
+and `logs/uploaded-r2.txt`) and `--files-from --no-traverse`, so uploads complete in
+seconds without traversing historical objects or `_backups/`.
 
 | Lock (`logs/`) | Held by | When busy |
 |----------------|---------|-----------|
 | `validation.lock` | update + validation + publish | run exits `Already running (... pid N, since T)` |
-| `public.lock` | publish step, `compress-old-data.sh`, upload snapshot (< 1 s) | waits (publish and snapshot 15 min, compress 1 h) |
-| `upload-do.lock`, `upload-r2.lock` | `upload-do.sh`, `upload-r2.sh` incl. backups (also manual runs) | upload skipped; the next run syncs everything |
+| `public.lock` | publish step, `compress-old-data.sh` snapshot/cleanup, upload snapshot (< 1 s) | waits (publish and snapshot 15 min, compress 1 h) |
+| `cron-log.lock` | `run-batch-validation.sh` (shared), `cron.log` rotation (exclusive) | waits up to 300 s (on timeout, batch warns and runs unlocked, so concurrent rotation could drop lines) |
+| `compress.lock` | `compress-old-data.sh` | duplicate compress exits cleanly |
+| `upload-do.lock`, `upload-r2.lock` | `upload-do.sh`, `upload-r2.sh` | live upload skipped; backup uploads wait up to 5 min |
 | `prune.lock` | `prune-backups.sh` | prune skipped |
 
 Lock files hold the holder's `pid start-time` and are never deleted.
 
-Nothing in `public/` is written in place: files reach it by rename from `tmp/`.
-Each upload syncs a hard-link snapshot of `public/` (`tmp/upload-do.snap/`,
-`tmp/upload-r2.snap/`) taken under `public.lock`, so it always uploads one
-complete publish, and a publish during a long upload cannot change a file rclone
-is reading (which made rclone fail it as `corrupted on transfer` and skip
-deletions). Newer results go up with the next upload. The snapshot is removed
-when rclone finishes; one left by a killed upload is removed by the next upload
-to the same provider. If a snapshot cannot be removed, the upload logs a
-`WARNING` and syncs `public/` directly until it is gone.
+Nothing in `public/` is written in place: publish steps stage `.aroi-tmp.*` files
+directly on `public/`'s filesystem and atomically rename them into place.
+Each live upload takes a hard-link snapshot of `public/` (`tmp/upload-do.snap/`,
+`tmp/upload-r2.snap/`) under `public.lock`. The snapshot is removed when rclone
+finishes; one left by a killed upload is removed by the next upload to the same
+provider.
 
 Temp files an interrupted publish leaves in `tmp/` are removed by the next
 publish or compress once it holds `public.lock` (logged as `Removed N leftover
@@ -130,13 +156,12 @@ Per run, `cron.log` shows:
 
 ```
 HEAD is now at 6e070ff ...                     # code update succeeded
-WARNING: code update failed at 'git fetch origin main' (exit 128): ... - running existing checkout
 Code: 6e070ff <subject> (origin/main 6e070ff)  # code that ran; full SHA is passed to the validator as AROIVALIDATOR_COMMIT
-Note: validating while DO upload (pid 889905, since 2026-10-12 00:00:31) is still running
-Validation + publish done in 41s, validation lock released
-↷ skipping DO upload: previous still running (pid 889905, since 2026-10-12 00:00:31) [batch 01:00:01]
-✓ R2 (95s) [batch 01:00:01]
-=== Complete Mon Oct 12 01:02:37 AM PDT 2026 [batch 01:00:01] ===
+Validation + publish done in 35s, validation lock released
+=== Cloud Upload [batch 08:00:01] ===
+✓ DO (2s) [batch 08:00:01]
+✓ R2 (2s) [batch 08:00:01]
+=== Complete Sat Nov 21 08:00:39 AM PST 2026 [batch 08:00:01] ===
 ```
 
 Lines after the lock is released are tagged `[batch HH:MM:SS]` (the run's start
@@ -150,10 +175,11 @@ time), because a run waiting on a long upload can finish after the next run star
 ~/aroivalidator/           # Code (validator)
 ~/aroivalidator-deploy/    # This repo
 ├── config.env             # Your settings (gitignored)
-├── scripts/               # Automation
+├── scripts/               # Automation, archival & parity verification
 ├── functions/             # Pages Function (data proxy)
-├── public/                # Local JSON results
-└── logs/                  # cron.log
+├── local-archive/         # Monthly zstd --long=27 archives + .list manifests
+├── public/                # Local current-month JSONs, latest.json, files.json
+└── logs/                  # cron.log, upload ledgers, lock files, log archives
 ```
 
 ---
@@ -162,7 +188,7 @@ time), because a run waiting on a long upload can finish after the next run star
 
 | File | TTL |
 |------|-----|
-| `latest.json` | 60s |
+| `latest.json`, `files.json` | 60s |
 | `aroi_validation_*.json` | 1 year (immutable) |
 
 ---

@@ -8,64 +8,80 @@ set -euo pipefail
 # Source shared functions
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
-# Remote names (unique to this project)
-AROI_R2_REMOTE="aroi-r2"
-AROI_DO_REMOTE="aroi-spaces"
+# Remote names (unique to this project; overridable in env or config.env)
+: "${AROI_R2_REMOTE:=aroi-r2}"
+: "${AROI_DO_REMOTE:=aroi-spaces}"
 
 # Cached rclone options (populated by init_upload)
 declare -a RCLONE_OPTS_ARRAY=()
 
-# Initialize paths and config
+# Initialize paths, rclone binary, and upload defaults from config.env.
 init_upload() {
     init_paths 2  # Use grandparent caller's location
     load_config || true
-    
+
     SOURCE_DIR="${1:-${OUTPUT_DIR:-$DEPLOY_DIR/public}}"
-    BACKUP_DIR="${BACKUP_DIR:-$DEPLOY_DIR/backups}"
+    ARCHIVE_DIR="${ARCHIVE_DIR:-$DEPLOY_DIR/local-archive}"
     LOG_DIR="$DEPLOY_DIR/logs"
     STAGE_DIR="$DEPLOY_DIR/tmp"  # same filesystem as public/: upload snapshots are hard links
     RCLONE="${RCLONE_PATH:-$(command -v rclone 2>/dev/null || echo "$HOME/bin/rclone")}"
-    TODAY=$(date '+%Y-%m-%d')
-    TIMESTAMP=$(date '+%Y-%m-%d_%H%M%S')
-    
-    mkdir -p "$LOG_DIR" "$BACKUP_DIR"
-    
-    # Rclone defaults (can override per-backend)
+
+    mkdir -p "$LOG_DIR" "$ARCHIVE_DIR" "$STAGE_DIR"
+
+    # Rclone defaults (apply provider-specific config.env settings after load_config)
+    if [[ "${STORAGE_NAME:-}" == "DO-Spaces" ]]; then
+        TRANSFERS="${DO_RCLONE_TRANSFERS:-${TRANSFERS:-56}}"
+        CHECKERS="${DO_RCLONE_CHECKERS:-${CHECKERS:-80}}"
+    elif [[ "${STORAGE_NAME:-}" == "R2" ]]; then
+        TRANSFERS="${RCLONE_TRANSFERS:-${TRANSFERS:-128}}"
+        CHECKERS="${RCLONE_CHECKERS:-${CHECKERS:-256}}"
+    fi
     : "${TRANSFERS:=64}" "${CHECKERS:=128}" "${BUFFER:=64M}" "${S3_CONC:=16}" "${S3_CHUNK:=16M}"
-    
-    # Cache rclone options array once
+    TRANSFERS=$(validate_int_range "TRANSFERS" "$TRANSFERS" 1 512 64)
+    CHECKERS=$(validate_int_range "CHECKERS" "$CHECKERS" 1 1024 128)
+    S3_CONC=$(validate_int_range "S3_CONC" "$S3_CONC" 1 128 16)
+
+    # All uploads use explicit --files-from + --no-traverse so S3 listings of
+    # historical objects or _backups/ prefixes are never traversed per run.
     RCLONE_OPTS_ARRAY=(
         "--transfers=$TRANSFERS" "--checkers=$CHECKERS" "--buffer-size=$BUFFER"
         "--s3-upload-concurrency=$S3_CONC" "--s3-chunk-size=$S3_CHUNK"
-        "--fast-list" "--stats=10s" "--stats-one-line" "--log-level=NOTICE"
+        "--no-traverse" "--stats=10s" "--stats-one-line" "--log-level=NOTICE"
         "--retries=5" "--retries-sleep=2s" "--low-level-retries=10"
     )
 }
 
-# Per-provider lock, held until this script and its rclone children exit, so a long
-# backup/sync never overlaps the next upload to the same provider. A busy provider
-# is skipped rather than waited for: rclone sync is idempotent, the next run catches up.
+# Acquire per-provider upload lock (fd 8). By default (wait_seconds=0), returns
+# $UPLOAD_SKIPPED if a previous upload to this provider is still running.
+# Passing wait_seconds > 0 waits up to that duration (used for backup uploads).
 lock_upload() {
-    local lock="$LOG_DIR/upload-$1.lock"
+    local provider=$1 wait_seconds=${2:-0}
+    local lock="$LOG_DIR/upload-${provider}.lock"
     exec 8>>"$lock"
-    if ! flock -n 8; then
-        log "Skipping upload: previous still running ($(lock_holder "$lock"))"
-        exit "$UPLOAD_SKIPPED"
+    if [[ "$wait_seconds" -gt 0 ]]; then
+        if ! flock -w "$wait_seconds" 8; then
+            log_error "Upload lock busy after ${wait_seconds}s ($(lock_holder "$lock"))"
+            exit 1
+        fi
+    else
+        if ! flock -n 8; then
+            log "Skipping upload: previous still running ($(lock_holder "$lock"))"
+            exit "$UPLOAD_SKIPPED"
+        fi
     fi
     note_lock_holder "$lock"
     # This provider's snapshot (see snapshot_source). One left by a killed upload is
     # removed here: holding the lock means no rclone of that upload still reads it.
-    UPLOAD_SNAP="$STAGE_DIR/upload-$1.snap"
+    UPLOAD_SNAP="$STAGE_DIR/upload-${provider}.snap"
     remove_snapshot "$UPLOAD_SNAP" || true
 }
 
-# Remove an upload snapshot. cp -a gives its directories the modes of those in public/,
-# so a read-only directory there (e.g. archives/ at 555) would make rm -rf fail, and
-# with it every later upload to this provider. The directories are the snapshot's own:
-# make them writable first. Never chmod its files: they are hard links to the published
-# files and share their modes. Warns and returns 1 if it still cannot be removed.
+# Remove an upload snapshot. cp -al copies directory modes from public/,
+# so a read-only directory would make rm -rf fail. The directories are the
+# snapshot's own: make them writable first. Never chmod files (hard links).
 remove_snapshot() {
     local snap=$1 err
+    [[ -n "$snap" ]] || return 0
     [[ -e "$snap" || -L "$snap" ]] || return 0
     find "$snap" -type d ! -perm -u=rwx -exec chmod u+rwx {} \; 2>/dev/null || true
     err=$(rm -rf "$snap" 2>&1) && return 0
@@ -76,17 +92,13 @@ remove_snapshot() {
 # Take a hard-link snapshot of SOURCE_DIR under public.lock (so never mid-publish) and
 # set SYNC_SOURCE to it. Publishes and compress-old-data.sh only rename new files into
 # public/ and never write in place, so the snapshot's files cannot change while rclone
-# reads them. Syncing public/ itself, a publish during a long sync makes rclone fail
-# the file ("corrupted on transfer"), skip deletions and retry the whole sync.
-# Falls back to SOURCE_DIR (with a warning) if the snapshot cannot be made.
+# reads them. Falls back to SOURCE_DIR (with a warning) if the snapshot cannot be made.
 snapshot_source() {
     local lock="$LOG_DIR/public.lock" err
     SYNC_SOURCE="$SOURCE_DIR"
     mkdir -p "$STAGE_DIR"
-    # lock_upload could not remove the last snapshot (and warned). Copying into it would
-    # add back files since deleted from public/, and the sync would upload them again.
     if [[ -e "$UPLOAD_SNAP" || -L "$UPLOAD_SNAP" ]]; then
-        log "WARNING: $UPLOAD_SNAP still present - syncing $SOURCE_DIR directly"
+        log "WARNING: $UPLOAD_SNAP still present - uploading from $SOURCE_DIR directly"
         UPLOAD_SNAP=""
         return 0
     fi
@@ -100,17 +112,18 @@ snapshot_source() {
     if err=$(cp -al "$SOURCE_DIR/." "$UPLOAD_SNAP" 2>&1); then  # "/.": follow a symlinked SOURCE_DIR
         SYNC_SOURCE="$UPLOAD_SNAP"
     else
-        log "WARNING: snapshot failed (${err%%$'\n'*}) - syncing $SOURCE_DIR directly"
+        log "WARNING: snapshot failed (${err%%$'\n'*}); uploading from $SOURCE_DIR directly"
         remove_snapshot "$UPLOAD_SNAP" || true
     fi
     exec 7>&-
 }
 
+# Verify rclone binary exists and is executable.
 check_rclone() {
     [[ -x "$RCLONE" ]] || { log_error "rclone not found at $RCLONE"; return 1; }
 }
 
-# Remote setup (creates if not exists)
+# Configure an rclone S3 remote if it does not already exist.
 ensure_remote() {
     local name=$1 provider=$2; shift 2
     "$RCLONE" listremotes 2>/dev/null | grep -q "^${name}:$" && return 0
@@ -119,6 +132,7 @@ ensure_remote() {
     log_success "Remote '$name' configured"
 }
 
+# Ensure Cloudflare R2 rclone remote is configured.
 ensure_r2_remote() {
     [[ -n "${R2_ACCESS_KEY_ID:-}" && -n "${R2_SECRET_ACCESS_KEY:-}" && -n "${CLOUDFLARE_ACCOUNT_ID:-}" ]] || {
         log_error "R2 credentials not set"; return 1
@@ -130,6 +144,7 @@ ensure_r2_remote() {
         acl=private
 }
 
+# Ensure DigitalOcean Spaces rclone remote is configured.
 ensure_do_remote() {
     [[ -n "${DO_SPACES_KEY:-}" && -n "${DO_SPACES_SECRET:-}" ]] || {
         log_error "DO credentials not set"; return 1
@@ -141,8 +156,8 @@ ensure_do_remote() {
         acl=public-read no_check_bucket=true
 }
 
-# Print the first 10 and last 5 lines of rclone's output. Reads all of it: with head -n,
-# rclone was killed by SIGPIPE mid-transfer at its next log line once head had exited.
+# Print the first 10 and last 5 lines of rclone's output while draining stdin
+# so rclone is never killed by SIGPIPE mid-transfer.
 rclone_summary() {
     awk -v h=10 -v t=5 '
         NR <= h { print; fflush(); next }
@@ -153,55 +168,276 @@ rclone_summary() {
         }'
 }
 
-# Backup if not done today (returns 0 if backup made, 1 if skipped or failed)
-maybe_backup() {
-    local bucket="$1" marker="$2" type="$3" force="${4:-false}" rc=0
-    [[ "$force" == "true" ]] || { [[ -f "$marker" && "$(cat "$marker")" == "$TODAY" ]] && return 1; }
-    
-    local target
-    if [[ "$type" == "local" ]]; then
-        target="$BACKUP_DIR/backup-$TIMESTAMP"
-        log "Local backup → $target"
-        mkdir -p "$target"
-    else
-        target="$bucket/_backups/$TIMESTAMP"
-        log "Remote backup → $target"
-    fi
-    "$RCLONE" sync "$bucket" "$target" --exclude "_backups/**" "${RCLONE_OPTS_ARRAY[@]}" 2>&1 | rclone_summary || rc=${PIPESTATUS[0]}
-    echo "$TODAY" > "$marker"  # attempted today, as before: a failed backup is not retried hourly
-    if [[ $rc -ne 0 ]]; then
-        log_error "${type^} backup to $target failed (rclone exit $rc)"
-        return 1
-    fi
-    log_success "${type^} backup done"
-}
-
-# Main upload function
+# Append-only live bucket upload using per-provider ledger:
+#   1. Copies un-uploaded non-empty aroi_validation_*.json files with --ignore-existing.
+#   2. Updates the provider ledger only after rclone copy exits 0.
+#   3. Always uploads latest.json and files.json (overwriting remote metadata).
 do_upload() {
-    local bucket="$1" rc=0
+    local bucket=$1 provider_id=$2 full_copy=${3:-false}
+    local rc=0 ledger_file work_dir local_list pending_file meta_file tmp_ledger pending_count mf
+    local ledger_matches=true
+
     snapshot_source || return 1
-    log "Syncing $SYNC_SOURCE → $bucket"
-    "$RCLONE" sync "$SYNC_SOURCE" "$bucket" --exclude "_backups/**" --exclude "index.html" "${RCLONE_OPTS_ARRAY[@]}" 2>&1 | rclone_summary || rc=${PIPESTATUS[0]}
-    # Not an EXIT trap: that would also run if this script is killed while its rclone
-    # keeps reading the snapshot. A leftover is removed by the next lock_upload.
-    remove_snapshot "$UPLOAD_SNAP" || true
-    if [[ $rc -ne 0 ]]; then
-        log_error "Sync to $bucket failed (rclone exit $rc)"
-        return "$rc"
+
+    ledger_file="$LOG_DIR/uploaded-${provider_id}.txt"
+    work_dir=$(mktemp -d "$STAGE_DIR/upload-${provider_id}.XXXXXX")
+    local_list="$work_dir/local.txt"
+    pending_file="$work_dir/pending.txt"
+    meta_file="$work_dir/meta.txt"
+    tmp_ledger="$work_dir/ledger.txt"
+
+    list_nonempty_validation_files "$SYNC_SOURCE" > "$local_list"
+
+    if ! read_upload_ledger "$ledger_file" "$bucket" "$tmp_ledger"; then
+        ledger_matches=false
     fi
+
+    if [[ "$full_copy" == "true" || "$ledger_matches" != "true" || ! -s "$tmp_ledger" ]]; then
+        cp "$local_list" "$pending_file"
+    else
+        comm -23 "$local_list" "$tmp_ledger" > "$pending_file"
+    fi
+
+    if [[ -s "$pending_file" ]]; then
+        pending_count=$(wc -l < "$pending_file" | tr -d '[:space:]')
+        log "Copying $pending_count validation file(s) → $bucket"
+        "$RCLONE" copy "$SYNC_SOURCE" "$bucket" \
+            --files-from "$pending_file" --ignore-existing \
+            "${RCLONE_OPTS_ARRAY[@]}" 2>&1 | rclone_summary || rc=${PIPESTATUS[0]}
+        if [[ $rc -ne 0 ]]; then
+            log_error "Copy to $bucket failed (rclone exit $rc)"
+            rm -rf "$work_dir"
+            remove_snapshot "$UPLOAD_SNAP" || true
+            return "$rc"
+        fi
+        {
+            [[ "$ledger_matches" == "true" && -s "$tmp_ledger" ]] && cat "$tmp_ledger" || true
+            cat "$pending_file"
+        } > "$work_dir/ledger.entries"
+        write_upload_ledger "$ledger_file" "$bucket" "$work_dir/ledger.entries"
+    else
+        if [[ "$ledger_matches" != "true" && -e "$ledger_file" ]]; then
+            write_upload_ledger "$ledger_file" "$bucket" "$pending_file"
+        fi
+        log "No new hourly JSON files to copy"
+    fi
+
+    : > "$meta_file"
+    for mf in latest.json files.json; do
+        [[ -s "$SYNC_SOURCE/$mf" ]] && echo "$mf" >> "$meta_file"
+    done
+
+    if [[ -s "$meta_file" ]]; then
+        log "Updating metadata → $bucket"
+        "$RCLONE" copy "$SYNC_SOURCE" "$bucket" \
+            --files-from "$meta_file" \
+            "${RCLONE_OPTS_ARRAY[@]}" 2>&1 | rclone_summary || rc=${PIPESTATUS[0]}
+        if [[ $rc -ne 0 ]]; then
+            log_error "Metadata copy to $bucket failed (rclone exit $rc)"
+            rm -rf "$work_dir"
+            remove_snapshot "$UPLOAD_SNAP" || true
+            return "$rc"
+        fi
+    fi
+
+    rm -rf "$work_dir"
+    remove_snapshot "$UPLOAD_SNAP" || true
     log_success "Upload complete"
 }
 
-# List backups helper
+# Upload monthly zstd archives and their .list manifests from ARCHIVE_DIR (or a validated custom dir)
+# to $bucket/_backups/ (never deletes remote backup objects).
+# Pass force_overwrite=true to include --ignore-times after strictly validating each backup pair.
+upload_zstd_backups() {
+    local bucket=$1 month=${2:-} force_overwrite=${3:-false} custom_dir=${4:-}
+    local work_dir list_file src_dir rc=0 count=0 name
+    local holding_archive_lock=false
+    local -a copy_opts=("${RCLONE_OPTS_ARRAY[@]}")
+
+    if [[ "$force_overwrite" == "true" ]]; then
+        copy_opts+=("--ignore-times")
+    fi
+
+    if [[ -n "$month" ]]; then
+        validate_pattern "$month" '^[0-9]{6}$' "month" || return 1
+    fi
+
+    src_dir="${custom_dir:-$ARCHIVE_DIR}"
+    [[ -d "$src_dir" ]] || { log_error "Archive directory not found: $src_dir"; return 1; }
+
+    work_dir=$(mktemp -d "$STAGE_DIR/backup-files.XXXXXX")
+    list_file="$work_dir/files.txt"
+    : > "$list_file"
+
+    if [[ "$force_overwrite" == "true" ]]; then
+        local validate_dir="$src_dir" archive_lock="$LOG_DIR/archive.lock"
+        if [[ -z "$custom_dir" ]]; then
+            # Direct --repair-backups invocation: hold archive.lock across capture, verification,
+            # and repair upload so compress-old-data cannot publish a newer generation underneath it.
+            local pair_dir="$work_dir/pair"
+            mkdir -p "$pair_dir"
+            exec 5>>"$archive_lock"
+            if ! flock -w 300 5; then
+                exec 5>&-
+                log_error "Archive lock busy after 300s; refusing repair backup upload"
+                rm -rf "$work_dir"
+                return 1
+            fi
+            holding_archive_lock=true
+            note_lock_holder "$archive_lock"
+
+            if [[ -n "$month" ]]; then
+                for name in "aroi-${month}.tar.zst" "aroi-${month}.list"; do
+                    if [[ ! -s "$ARCHIVE_DIR/$name" ]]; then
+                        exec 5>&-
+                        log_error "Missing or empty backup artifact: $ARCHIVE_DIR/$name"
+                        rm -rf "$work_dir"
+                        return 1
+                    fi
+                    ln "$ARCHIVE_DIR/$name" "$pair_dir/$name" 2>/dev/null || cp -p "$ARCHIVE_DIR/$name" "$pair_dir/$name" || {
+                        exec 5>&-
+                        rm -rf "$work_dir"
+                        return 1
+                    }
+                done
+            else
+                local raw_cand m
+                if ! raw_cand=$(cd "$ARCHIVE_DIR" && find . -maxdepth 1 \( -name 'aroi-*.tar.zst' -o -name 'aroi-*.list' \) -type f); then
+                    exec 5>&-
+                    rm -rf "$work_dir"
+                    return 1
+                fi
+                if [[ -n "$raw_cand" ]]; then
+                    while IFS= read -r m; do
+                        [[ -z "$m" ]] && continue
+                        for name in "aroi-${m}.tar.zst" "aroi-${m}.list"; do
+                            if [[ ! -s "$ARCHIVE_DIR/$name" ]]; then
+                                exec 5>&-
+                                log_error "Incomplete backup pair for $m ($ARCHIVE_DIR/$name)"
+                                rm -rf "$work_dir"
+                                return 1
+                            fi
+                            ln "$ARCHIVE_DIR/$name" "$pair_dir/$name" 2>/dev/null || cp -p "$ARCHIVE_DIR/$name" "$pair_dir/$name" || {
+                                exec 5>&-
+                                rm -rf "$work_dir"
+                                return 1
+                            }
+                        done
+                    done < <(printf '%s\n' "$raw_cand" | sed -E 's#^\./aroi-([0-9]{6})\.(tar\.zst|list)$#\1#' | { grep -E '^[0-9]{6}$' || true; } | LC_ALL=C sort -u)
+                fi
+            fi
+            validate_dir="$pair_dir"
+        fi
+
+        src_dir="$validate_dir"
+        if [[ -n "$month" ]]; then
+            if ! verify_local_backup_pair "$src_dir" "$month" "$work_dir"; then
+                [[ "$holding_archive_lock" == "true" ]] && exec 5>&-
+                rm -rf "$work_dir"
+                return 1
+            fi
+            printf 'aroi-%s.tar.zst\naroi-%s.list\n' "$month" "$month" > "$list_file"
+        else
+            local raw_m m
+            if ! raw_m=$(cd "$src_dir" && find . -maxdepth 1 \( -name 'aroi-*.tar.zst' -o -name 'aroi-*.list' \) -type f); then
+                [[ "$holding_archive_lock" == "true" ]] && exec 5>&-
+                rm -rf "$work_dir"
+                return 1
+            fi
+            if [[ -n "$raw_m" ]]; then
+                while IFS= read -r m; do
+                    [[ -z "$m" ]] && continue
+                    if ! verify_local_backup_pair "$src_dir" "$m" "$work_dir"; then
+                        [[ "$holding_archive_lock" == "true" ]] && exec 5>&-
+                        rm -rf "$work_dir"
+                        return 1
+                    fi
+                    printf 'aroi-%s.tar.zst\naroi-%s.list\n' "$m" "$m" >> "$list_file"
+                done < <(printf '%s\n' "$raw_m" | sed -E 's#^\./aroi-([0-9]{6})\.(tar\.zst|list)$#\1#' | { grep -E '^[0-9]{6}$' || true; } | LC_ALL=C sort -u)
+            fi
+            if [[ ! -s "$list_file" ]]; then
+                log "No zstd archives found in $src_dir"
+                [[ "$holding_archive_lock" == "true" ]] && exec 5>&-
+                rm -rf "$work_dir"
+                return 0
+            fi
+        fi
+
+        if [[ -n "$custom_dir" ]]; then
+            # Custom captured generation (e.g., verify-sync VALIDATED_PAIR_DIR):
+            # hold archive.lock across freshness check + upload so a newer local archive cannot be clobbered.
+            exec 5>>"$archive_lock"
+            if ! flock -w 300 5; then
+                exec 5>&-
+                log_error "Archive lock busy after 300s; refusing repair backup upload"
+                rm -rf "$work_dir"
+                return 1
+            fi
+            holding_archive_lock=true
+            note_lock_holder "$archive_lock"
+            while IFS= read -r name; do
+                [[ -z "$name" ]] && continue
+                if [[ ! -s "$ARCHIVE_DIR/$name" ]] || ! cmp -s "$ARCHIVE_DIR/$name" "$src_dir/$name"; then
+                    exec 5>&-
+                    log_error "Refusing stale repair upload for $name: $ARCHIVE_DIR changed since capture; retry verify-sync"
+                    rm -rf "$work_dir"
+                    return 1
+                fi
+            done < "$list_file"
+        fi
+    elif [[ -n "$month" ]]; then
+        for name in "aroi-${month}.tar.zst" "aroi-${month}.list"; do
+            if [[ ! -s "$src_dir/$name" ]]; then
+                log_error "Missing or empty backup artifact: $src_dir/$name"
+                rm -rf "$work_dir"
+                return 1
+            fi
+            echo "$name" >> "$list_file"
+        done
+    else
+        (
+            cd "$src_dir"
+            find . -maxdepth 1 \( -name 'aroi-*.tar.zst' -o -name 'aroi-*.list' \) -type f -size +0c 2>/dev/null \
+                | sed 's|^\./||' \
+                | grep -E '^aroi-[0-9]{6}\.(tar\.zst|list)$' \
+                | LC_ALL=C sort -u || true
+        ) > "$list_file"
+        if [[ ! -s "$list_file" ]]; then
+            log "No zstd archives found in $src_dir"
+            rm -rf "$work_dir"
+            return 0
+        fi
+    fi
+
+    local mode_note=""
+    [[ "$force_overwrite" == "true" ]] && mode_note=" (repairing mismatched artifacts)"
+    count=$(wc -l < "$list_file" | tr -d '[:space:]')
+    log "Uploading $count zstd backup artifact(s) → $bucket/_backups/${mode_note}"
+    "$RCLONE" copy "$src_dir" "$bucket/_backups" \
+        --files-from "$list_file" \
+        "${copy_opts[@]}" 5>&- 2>&1 | rclone_summary || rc=${PIPESTATUS[0]}
+    [[ "$holding_archive_lock" == "true" ]] && exec 5>&-
+    rm -rf "$work_dir"
+    if [[ $rc -ne 0 ]]; then
+        log_error "Backup archive upload to $bucket/_backups failed (rclone exit $rc)"
+        return "$rc"
+    fi
+    log_success "Uploaded zstd backup(s) to $bucket/_backups"
+}
+
+# List local and remote zstd backup archives.
 list_backups() {
-    local bucket="$1"
-    local storage="$2"
-    local storage_lower=$(echo "$storage" | tr '[:upper:]' '[:lower:]')
-    local local_marker="$LOG_DIR/last-${storage_lower}-local-backup-date"
-    local remote_marker="$LOG_DIR/last-${storage_lower}-backup-date"
-    
-    echo "📦 Local: $(ls -1dt "$BACKUP_DIR"/backup-* 2>/dev/null | head -3 | tr '\n' ' ' || echo none)"
-    echo "📦 ${storage}: $("$RCLONE" lsf "$bucket/_backups/" --dirs-only 2>/dev/null | sort -r | head -3 | tr '\n' ' ' || echo none)"
-    echo "📅 Last local: $(cat "$local_marker" 2>/dev/null || echo never)"
-    echo "📅 Last ${storage}: $(cat "$remote_marker" 2>/dev/null || echo never)"
+    local bucket=$1 storage=$2
+    echo "📦 Local ($ARCHIVE_DIR):"
+    if [[ -d "$ARCHIVE_DIR" ]] && compgen -G "$ARCHIVE_DIR/aroi-*.tar.zst" >/dev/null 2>&1; then
+        local zf
+        while IFS= read -r zf; do
+            [[ -n "$zf" ]] && printf '  %s\t%s\n' "$(du -sh "$zf" 2>/dev/null | cut -f1)" "$(basename "$zf")"
+        done < <(find "$ARCHIVE_DIR" -maxdepth 1 -name 'aroi-*.tar.zst' -type f 2>/dev/null | LC_ALL=C sort | tail -12)
+    else
+        echo "  (none)"
+    fi
+    echo "📦 ${storage} ($bucket/_backups/):"
+    "$RCLONE" lsf "$bucket/_backups/" --max-depth 1 --files-only --include "aroi-*.tar.zst" 2>/dev/null \
+        | LC_ALL=C sort -r | head -12 || echo "  (none)"
 }

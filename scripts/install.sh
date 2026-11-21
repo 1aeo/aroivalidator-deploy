@@ -63,12 +63,13 @@ fi
 log "Installing dependencies..."
 if [[ $EUID -eq 0 ]]; then
     apt-get update -qq
-    apt-get install -y -qq python3-venv curl jq gettext-base > /dev/null 2>&1
+    apt-get install -y -qq python3-venv curl jq gettext-base zstd > /dev/null 2>&1
     ok "System packages"
 else
     command -v python3 &>/dev/null || err "python3 required"
     command -v curl &>/dev/null || err "curl required"
     command -v jq &>/dev/null || err "jq required"
+    command -v zstd &>/dev/null || err "zstd required"
     ok "Dependencies found"
 fi
 
@@ -83,7 +84,7 @@ pip install -q streamlit dnspython pandas requests urllib3
 ok "Python environment"
 
 # Create directories
-mkdir -p "$DEPLOY_DIR"/{logs,public,backups,pages-static}
+mkdir -p "$DEPLOY_DIR"/{logs,public,local-archive,backups,pages-static}
 [[ -f "$DEPLOY_DIR/public/index.html" ]] && cp -f "$DEPLOY_DIR/public/index.html" "$DEPLOY_DIR/pages-static/"
 ok "Directories"
 

@@ -8,6 +8,7 @@ pages-static/
 
 # Data files
 logs/
+local-archive/
 public/*.json
 public/files.json
 public/archives/
