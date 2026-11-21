@@ -79,8 +79,8 @@ backed up in highly compressed monthly `zstd --long=27` archives (`aroi-YYYYMM.t
 
 | Location | Contents | Retention / Notes |
 |----------|----------|-------------------|
-| DO Spaces root | All uncompressed hourly JSONs + `latest.json` + `files.json` | Append-only `rclone copy --no-traverse --ignore-existing` |
-| Cloudflare R2 root | Identical copy of all hourly JSONs + `latest.json` + `files.json` | Append-only `rclone copy --no-traverse --ignore-existing` |
+| DO Spaces root | All uncompressed hourly JSONs + `latest.json` + `files.json` | Hourly JSONs: append-only `rclone copy --no-traverse --ignore-existing`; `latest.json` & `files.json`: copied separately without `--ignore-existing` |
+| Cloudflare R2 root | Identical copy of all hourly JSONs + `latest.json` + `files.json` | Hourly JSONs: append-only `rclone copy --no-traverse --ignore-existing`; `latest.json` & `files.json`: copied separately without `--ignore-existing` |
 | DO Spaces `_backups/` & R2 `_backups/` | `aroi-YYYYMM.tar.zst` + `aroi-YYYYMM.list` | Uploaded daily for current month, finalized on month rollover |
 | Local `local-archive/` | `aroi-YYYYMM.tar.zst` + `aroi-YYYYMM.list` | Complete compressed local history (~3.5 MiB/month) |
 | Local `public/` | `latest.json`, `files.json`, and current month's hourly JSONs | Completed months removed only after 3-copy verification |

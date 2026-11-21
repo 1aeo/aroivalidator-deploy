@@ -11,6 +11,7 @@ STORAGE_NAME="R2"
 MODE="live"
 FULL_COPY=false
 BACKUP_MONTH=""
+BACKUP_SRC_DIR=""
 FORCE_BACKUPS=false
 
 case "${1:-}" in
@@ -28,6 +29,7 @@ case "${1:-}" in
         MODE="backups"
         FORCE_BACKUPS=true
         BACKUP_MONTH="${2:-}"
+        BACKUP_SRC_DIR="${3:-}"
         init_upload
         ;;
     --full-copy)
@@ -35,7 +37,7 @@ case "${1:-}" in
         init_upload "${2:-}"
         ;;
     --help|-h)
-        echo "Usage: $0 [source_dir] | --full-copy [source_dir] | --upload-backups [YYYYMM] | --repair-backups [YYYYMM] | --list-backups"
+        echo "Usage: $0 [source_dir] | --full-copy [source_dir] | --upload-backups [YYYYMM] | --repair-backups [YYYYMM] [src_dir] | --list-backups"
         exit 0
         ;;
     --*)
@@ -52,7 +54,7 @@ if [[ "$MODE" == "backups" ]]; then
     check_rclone || exit 1
     ensure_r2_remote || exit 1
     BUCKET="${AROI_R2_REMOTE}:${R2_BUCKET:?}"
-    upload_zstd_backups "$BUCKET" "$BACKUP_MONTH" "$FORCE_BACKUPS"
+    upload_zstd_backups "$BUCKET" "$BACKUP_MONTH" "$FORCE_BACKUPS" "$BACKUP_SRC_DIR"
     exit 0
 fi
 

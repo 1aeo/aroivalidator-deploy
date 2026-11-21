@@ -30,7 +30,7 @@ assert_file_missing() {
 # Set up temporary workspace with copied deploy scripts + mock rclone
 WORK=$(mktemp -d)
 cleanup() {
-    [[ ! -e "$WORK/unreadable-backups" ]] || chmod 755 "$WORK/unreadable-backups" 2>/dev/null || true
+    chmod 755 "$DEPLOY/local-archive" "$WORK/unreadable-archive" "$WORK/unreadable-manifests" "$WORK/unreadable-backups" 2>/dev/null || true
     rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -777,17 +777,26 @@ else
 fi
 rm -f "$DEPLOY/local-archive/aroi-202502.list"
 
-# Corrupt local tarball for OLD7 while mocking healthy remote tarball -> --fix must NOT overwrite remote backup!
+# Corrupt local tarball for OLD7 while mocking healthy remote tarballs -> --fix must NOT overwrite either remote backup!
 cp "$DEPLOY/local-archive/aroi-${OLD7}.tar.zst" "$WORK/good-old7.tar.zst"
+cp "$MOCK_ROOT/do/test-bucket/_backups/aroi-${OLD7}.tar.zst" "$WORK/healthy-do.tar.zst"
+cp "$MOCK_ROOT/r2/test-bucket/_backups/aroi-${OLD7}.tar.zst" "$WORK/healthy-r2.tar.zst"
 printf 'bad-zst' > "$DEPLOY/local-archive/aroi-${OLD7}.tar.zst"
 if "$DEPLOY/scripts/verify-sync.sh" --fix >/dev/null 2>&1; then
     fail "verify-sync.sh --fix must fail on corrupt local tarball"
 else
     pass "verify-sync.sh --fix failed on corrupt local tarball without --verify-zstd"
 fi
-assert_eq "$(wc -c < "$MOCK_ROOT/do/test-bucket/_backups/aroi-${OLD7}.tar.zst" | tr -d '[:space:]')" \
-    "$(wc -c < "$WORK/good-old7.tar.zst" | tr -d '[:space:]')" \
-    "corrupt local tarball did not overwrite healthy remote backup"
+if cmp -s "$MOCK_ROOT/do/test-bucket/_backups/aroi-${OLD7}.tar.zst" "$WORK/healthy-do.tar.zst"; then
+    pass "corrupt local tarball did not overwrite healthy DO remote backup"
+else
+    fail "corrupt local tarball overwrote healthy DO remote backup"
+fi
+if cmp -s "$MOCK_ROOT/r2/test-bucket/_backups/aroi-${OLD7}.tar.zst" "$WORK/healthy-r2.tar.zst"; then
+    pass "corrupt local tarball did not overwrite healthy R2 remote backup"
+else
+    fail "corrupt local tarball overwrote healthy R2 remote backup"
+fi
 mv "$WORK/good-old7.tar.zst" "$DEPLOY/local-archive/aroi-${OLD7}.tar.zst"
 
 # Repair valid same-size/content-mismatched backup uses --ignore-times via --repair-backups
@@ -814,6 +823,95 @@ if jq -se 'length == 1 and (.[0] | type == "array")' "$DEPLOY/public/files.json"
 else
     fail "files.json still malformed after verify-sync.sh --fix"
 fi
+
+echo "=== 29. Unreadable ARCHIVE_DIR fails build_files_manifest & verify-sync without truncating ==="
+if [[ "$(id -u)" -ne 0 ]]; then
+    cp "$DEPLOY/public/files.json" "$WORK/prev-files.json"
+    chmod 111 "$DEPLOY/local-archive"
+    if (
+        # shellcheck source=common.sh
+        source "$DEPLOY/scripts/common.sh"
+        build_files_manifest "$DEPLOY/public" "$DEPLOY/local-archive"
+    ) >/dev/null 2>&1; then
+        chmod 755 "$DEPLOY/local-archive"
+        fail "build_files_manifest must fail when ARCHIVE_DIR is unreadable"
+    else
+        pass "build_files_manifest failed cleanly on unreadable ARCHIVE_DIR"
+    fi
+    if cmp -s "$DEPLOY/public/files.json" "$WORK/prev-files.json"; then
+        pass "previous files.json preserved intact when ARCHIVE_DIR unreadable"
+    else
+        chmod 755 "$DEPLOY/local-archive"
+        fail "files.json modified despite ARCHIVE_DIR scan error"
+    fi
+    if "$DEPLOY/scripts/verify-sync.sh" --verify-zstd >/dev/null 2>&1; then
+        chmod 755 "$DEPLOY/local-archive"
+        fail "verify-sync.sh --verify-zstd must fail when ARCHIVE_DIR is unreadable"
+    else
+        pass "verify-sync.sh --verify-zstd failed cleanly on unreadable ARCHIVE_DIR"
+    fi
+    chmod 755 "$DEPLOY/local-archive"
+else
+    pass "skipping chmod 111 unreadable ARCHIVE_DIR check under uid 0"
+fi
+
+echo "=== 30. Surviving remote .list without .tar.zst & public/ vs remote .tar.zst conflict ==="
+mkdir -p "$WORK/sec30-bk/local" "$WORK/sec30-bk/do" "$WORK/sec30-bk/r2"
+cp "$DEPLOY/local-archive/aroi-${OLD6}.tar.zst" "$DEPLOY/local-archive/aroi-${OLD6}.list" "$WORK/sec30-bk/local/"
+cp "$MOCK_ROOT/do/test-bucket/_backups/aroi-${OLD6}.tar.zst" "$MOCK_ROOT/do/test-bucket/_backups/aroi-${OLD6}.list" "$WORK/sec30-bk/do/"
+cp "$MOCK_ROOT/r2/test-bucket/_backups/aroi-${OLD6}.tar.zst" "$MOCK_ROOT/r2/test-bucket/_backups/aroi-${OLD6}.list" "$WORK/sec30-bk/r2/"
+
+# 30a: Surviving DO .list without any .tar.zst when both local archive files are absent
+rm -f "$DEPLOY/local-archive/aroi-${OLD6}.tar.zst" "$DEPLOY/local-archive/aroi-${OLD6}.list" \
+    "$MOCK_ROOT/do/test-bucket/_backups/aroi-${OLD6}.tar.zst" \
+    "$MOCK_ROOT/r2/test-bucket/_backups/aroi-${OLD6}.tar.zst" \
+    "$MOCK_ROOT/r2/test-bucket/_backups/aroi-${OLD6}.list"
+echo '{"m4b":2}' > "$DEPLOY/public/aroi_validation_${OLD6}02_000000.json"
+if "$DEPLOY/scripts/compress-old-data.sh" --month "$OLD6" >/dev/null 2>&1; then
+    fail "compress-old-data.sh must fail when surviving remote .list names unrecoverable member"
+else
+    pass "compress-old-data.sh refused partial overwrite when surviving remote .list present without .tar.zst"
+fi
+assert_file_missing "$DEPLOY/local-archive/aroi-${OLD6}.tar.zst" "did not build partial local tarball against surviving remote .list"
+
+# 30b: Remote .tar.zst exists while local archive absent and public/ has conflicting m4a payload
+cp "$WORK/sec30-bk/do/"* "$MOCK_ROOT/do/test-bucket/_backups/"
+cp "$WORK/sec30-bk/r2/"* "$MOCK_ROOT/r2/test-bucket/_backups/"
+rm -f "$DEPLOY/public/aroi_validation_${OLD6}02_000000.json"
+echo '{"m4a":"conflict-v2"}' > "$DEPLOY/public/aroi_validation_${OLD6}01_000000.json"
+if "$DEPLOY/scripts/compress-old-data.sh" --month "$OLD6" >/dev/null 2>&1; then
+    fail "compress-old-data.sh must fail on content conflict between public/ and remote .tar.zst"
+else
+    pass "compress-old-data.sh detected content conflict against remote .tar.zst"
+fi
+assert_eq "$(cat "$DEPLOY/public/aroi_validation_${OLD6}01_000000.json")" '{"m4a":"conflict-v2"}' "conflicting public file retained when remote .tar.zst differs"
+
+rm -f "$DEPLOY/public/aroi_validation_${OLD6}01_000000.json"
+cp "$WORK/sec30-bk/local/"* "$DEPLOY/local-archive/"
+"$DEPLOY/scripts/verify-sync.sh" --fix --verify-zstd >/dev/null
+"$DEPLOY/scripts/verify-sync.sh" --verify-zstd >/dev/null
+
+echo "=== 31. Direct --repair-backups refuses corrupt local tarball ==="
+cp "$DEPLOY/local-archive/aroi-${OLD7}.tar.zst" "$WORK/sec31-local-old7.tar.zst"
+cp "$MOCK_ROOT/do/test-bucket/_backups/aroi-${OLD7}.tar.zst" "$WORK/sec31-do-old7.tar.zst"
+printf 'bad-zst' > "$DEPLOY/local-archive/aroi-${OLD7}.tar.zst"
+: > "$MOCK_LOG"
+if "$DEPLOY/scripts/upload-do.sh" --repair-backups "$OLD7" >/dev/null 2>&1; then
+    fail "upload-do.sh --repair-backups must refuse corrupt local tarball"
+else
+    pass "upload-do.sh --repair-backups refused corrupt local tarball"
+fi
+if grep -q -- "--ignore-times" "$MOCK_LOG"; then
+    fail "upload-do.sh --repair-backups invoked --ignore-times on corrupt tarball"
+else
+    pass "upload-do.sh --repair-backups did not invoke --ignore-times on corrupt tarball"
+fi
+if cmp -s "$MOCK_ROOT/do/test-bucket/_backups/aroi-${OLD7}.tar.zst" "$WORK/sec31-do-old7.tar.zst"; then
+    pass "DO healthy backup untouched after refused direct --repair-backups"
+else
+    fail "DO healthy backup modified despite refused --repair-backups"
+fi
+mv "$WORK/sec31-local-old7.tar.zst" "$DEPLOY/local-archive/aroi-${OLD7}.tar.zst"
 
 echo ""
 echo "Summary: $PASS passed, $FAIL failed"

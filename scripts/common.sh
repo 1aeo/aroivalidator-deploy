@@ -111,6 +111,20 @@ file_size_bytes() {
     stat -c '%s' "$path" 2>/dev/null || stat -f '%z' "$path" 2>/dev/null || wc -c < "$path" | tr -d '[:space:]'
 }
 
+# Portable "<device>:<inode>" identifier without following symlinks.
+file_dev_ino() {
+    local path=$1 id
+    if id=$(stat -c '%d:%i' "$path" 2>/dev/null); then
+        printf '%s\n' "$id"
+        return 0
+    fi
+    if id=$(stat -f '%d:%i' "$path" 2>/dev/null); then
+        printf '%s\n' "$id"
+        return 0
+    fi
+    return 1
+}
+
 # Return 0 iff both paths exist and reside on the same filesystem device.
 same_filesystem() {
     local d1 d2
@@ -350,17 +364,20 @@ clean_publish_temps() {
 }
 
 # List non-empty hourly validation JSON basenames in a directory (sorted ascending).
-# Works portably across GNU and BSD find without ARG_MAX limits.
+# Distinguishes empty matches (rc 0) from scan/read errors (rc 1).
 list_nonempty_validation_files() {
-    local dir=$1
+    local dir=$1 raw_find filtered grep_rc=0
     [[ -d "$dir" ]] || return 0
-    (
-        cd "$dir"
-        find . -maxdepth 1 -name 'aroi_validation_*.json' -type f -size +0c 2>/dev/null \
-            | sed 's|^\./||' \
-            | grep -E "$AROI_JSON_REGEX" \
-            | LC_ALL=C sort -u || true
-    )
+    if ! raw_find=$(cd "$dir" && find . -maxdepth 1 -name 'aroi_validation_*.json' -type f -size +0c); then
+        return 1
+    fi
+    [[ -n "$raw_find" ]] || return 0
+    filtered=$(printf '%s\n' "$raw_find" | sed 's|^\./||' | grep -E "$AROI_JSON_REGEX") || grep_rc=$?
+    if (( grep_rc > 1 )); then
+        return 1
+    fi
+    [[ -n "$filtered" ]] || return 0
+    printf '%s\n' "$filtered" | LC_ALL=C sort -u
 }
 
 # Verify a local monthly backup pair (.tar.zst and .list) exists, is non-empty, passes zstd -t,
@@ -397,25 +414,37 @@ verify_local_backup_pair() {
 # flat JSON array combining:
 #   - all archived filenames listed in <archive_dir>/aroi-*.list
 #   - all non-empty hourly JSONs currently in <public_dir>
-# Call under public.lock.
+# Call under public.lock. Keeps existing files.json intact on any scan, read, or sort error.
 build_files_manifest() {
     local public_dir=$1 archive_dir=$2 _stage_dir=${3:-}
     mkdir -p "$public_dir"
 
-    local tmp_raw tmp_names tmp_manifest
+    local tmp_raw tmp_names tmp_manifest tmp_find=""
     tmp_raw=$(mktemp "$public_dir/.aroi-tmp.raw.XXXXXX") || return 1
     tmp_names=$(mktemp "$public_dir/.aroi-tmp.names.XXXXXX") || { rm -f "$tmp_raw"; return 1; }
     tmp_manifest=$(mktemp "$public_dir/.aroi-tmp.files.XXXXXX") || { rm -f "$tmp_raw" "$tmp_names"; return 1; }
 
     : > "$tmp_raw"
     if [[ -d "$archive_dir" ]]; then
-        local list_file
+        tmp_find=$(mktemp "$public_dir/.aroi-tmp.find.XXXXXX") || { rm -f "$tmp_raw" "$tmp_names" "$tmp_manifest"; return 1; }
+        if ! find "$archive_dir" -maxdepth 1 -name 'aroi-*.list' -type f -print0 > "$tmp_find"; then
+            rm -f "$tmp_find" "$tmp_raw" "$tmp_names" "$tmp_manifest"
+            return 1
+        fi
+        local list_file grep_rc read_err=0
         while IFS= read -r -d '' list_file; do
-            if ! { grep -E "$AROI_JSON_REGEX" "$list_file" 2>/dev/null || true; } >> "$tmp_raw"; then
-                rm -f "$tmp_raw" "$tmp_names" "$tmp_manifest"
-                return 1
+            grep_rc=0
+            grep -E "$AROI_JSON_REGEX" "$list_file" >> "$tmp_raw" || grep_rc=$?
+            if (( grep_rc > 1 )); then
+                read_err=1
+                break
             fi
-        done < <(find "$archive_dir" -maxdepth 1 -name 'aroi-*.list' -type f -print0 2>/dev/null)
+        done < "$tmp_find"
+        rm -f "$tmp_find"
+        if (( read_err )); then
+            rm -f "$tmp_raw" "$tmp_names" "$tmp_manifest"
+            return 1
+        fi
     fi
     if ! list_nonempty_validation_files "$public_dir" >> "$tmp_raw"; then
         rm -f "$tmp_raw" "$tmp_names" "$tmp_manifest"

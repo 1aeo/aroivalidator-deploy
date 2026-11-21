@@ -126,9 +126,10 @@ is_month_failed() {
 
 # Snapshot a month's non-empty files from PUBLIC_DIR into snap_dir using hard links
 # (cross-device fallback to cp -p), holding public.lock only for the directory scan/link.
+# When ident_file is provided, records "<dev>:<ino>\t<filename>" for each source file under public.lock.
 snapshot_month_files() {
-    local month=$1 snap_dir=$2
-    local scan_list rc=0 scan_rc=0 fn
+    local month=$1 snap_dir=$2 ident_file=${3:-}
+    local scan_list rc=0 scan_rc=0 fn dev_ino
 
     exec 7>>"$PUBLIC_LOCK"
     if ! flock -w "$COMPRESS_LOCK_WAIT" 7; then
@@ -140,6 +141,7 @@ snapshot_month_files() {
     clean_stage_dir "$STAGE_DIR"
     clean_publish_temps "$PUBLIC_DIR"
 
+    [[ -z "$ident_file" ]] || : > "$ident_file"
     scan_list=$(mktemp "$(dirname "$snap_dir")/.aroi-tmp.scan.XXXXXX") || { exec 7>&-; return 1; }
     if [[ -d "$PUBLIC_DIR" ]]; then
         if ! (
@@ -157,11 +159,19 @@ snapshot_month_files() {
         while IFS= read -r fn; do
             fn=${fn#./}
             [[ "$fn" =~ ^aroi_validation_${month}[0-9]{2}_[0-9]{6}\.json$ ]] || continue
+            if [[ -n "$ident_file" ]]; then
+                if ! dev_ino=$(file_dev_ino "$PUBLIC_DIR/$fn"); then
+                    echo "  ✗ Failed reading inode metadata for $fn ($month)"
+                    rc=1
+                    break
+                fi
+            fi
             if ! ln "$PUBLIC_DIR/$fn" "$snap_dir/$fn" 2>/dev/null && ! cp -p "$PUBLIC_DIR/$fn" "$snap_dir/$fn"; then
                 echo "  ✗ Failed snapshotting $fn for $month"
                 rc=1
                 break
             fi
+            [[ -z "$ident_file" ]] || printf '%s\t%s\n' "$dev_ino" "$fn" >> "$ident_file"
         done < "$scan_list"
     fi
 
@@ -170,17 +180,22 @@ snapshot_month_files() {
     return "$rc"
 }
 
-# Recover missing monthly members into snap_dir from verified remote _backups/aroi-YYYYMM.tar.zst.
-# When recover_all_if_present=true (e.g., local .list missing while local archive corrupt), recovers
-# all canonical members from an existing remote archive and fails if present remote backups fail checks.
+# Recover missing monthly members into snap_dir from verified remote _backups/aroi-YYYYMM.{tar.zst,list}.
+# Checks surviving remote manifests even if the tarball is missing, verifies overlapping public/ contents
+# against recovered tarballs, and allows an empty first-time build only when no remote artifacts exist.
 recover_remote_archive() {
     local month=$1 want_file=$2 snap_dir=$3 work_dir=$4 recover_all_if_present=${5:-false}
+    local required_file="$work_dir/recover-required-${month}.txt"
+    local init_file="$work_dir/recover-init-${month}.txt"
     local still_missing="$work_dir/recover-missing-${month}.txt"
+
+    list_nonempty_validation_files "$snap_dir" > "$init_file" || return 1
     if [[ -s "$want_file" ]]; then
-        LC_ALL=C sort -u "$want_file" > "$still_missing"
+        LC_ALL=C sort -u "$want_file" > "$required_file"
     else
-        : > "$still_missing"
+        : > "$required_file"
     fi
+    comm -23 "$required_file" "$init_file" > "$still_missing"
 
     if [[ "$NO_UPLOAD" == "true" ]] || [[ "$DO_ENABLED" != "true" && "$R2_ENABLED" != "true" ]]; then
         [[ "$recover_all_if_present" != "true" && ! -s "$still_missing" ]] && return 0
@@ -210,8 +225,9 @@ recover_remote_archive() {
     fi
 
     local archive_name="aroi-${month}.tar.zst"
+    local list_name="aroi-${month}.list"
     local idx prov bucket
-    local dl_dir ext_dir lsf_out rem_members to_ext rc fn
+    local dl_dir lsf_out has_zst has_list grep_rc
 
     for idx in "${!providers[@]}"; do
         prov="${providers[$idx]}"
@@ -220,79 +236,130 @@ recover_remote_archive() {
             break
         fi
 
-        if ! lsf_out=$("$RCLONE" lsf "$bucket/_backups/" --max-depth 1 --files-only --include "$archive_name" 2>/dev/null); then
+        if ! lsf_out=$("$RCLONE" lsf "$bucket/_backups/" --max-depth 1 --files-only --include "aroi-${month}.*" 2>/dev/null); then
             any_error=true
             continue
         fi
-        [[ -n "$lsf_out" ]] || continue
+        has_zst=false
+        has_list=false
+        grep -qxF "$archive_name" <<< "$lsf_out" && has_zst=true
+        grep -qxF "$list_name" <<< "$lsf_out" && has_list=true
+        [[ "$has_zst" == "true" || "$has_list" == "true" ]] || continue
 
         dl_dir=$(mktemp -d "$work_dir/recover-${prov}-${month}.XXXXXX")
-        printf '%s\n' "$archive_name" > "$dl_dir/want.txt"
+        : > "$dl_dir/want.txt"
+        [[ "$has_zst" == "true" ]] && echo "$archive_name" >> "$dl_dir/want.txt"
+        [[ "$has_list" == "true" ]] && echo "$list_name" >> "$dl_dir/want.txt"
+
         if ! "$RCLONE" copy "$bucket/_backups" "$dl_dir" --files-from "$dl_dir/want.txt" --no-traverse >/dev/null 2>&1; then
             any_error=true
             rm -rf "$dl_dir"
             continue
         fi
-        if [[ ! -s "$dl_dir/$archive_name" ]] \
-            || ! zstd -t --long="$ZSTD_DEC_LONG" "$dl_dir/$archive_name" >/dev/null 2>&1 \
-            || ! list_archive_members "$dl_dir/$archive_name" "$dl_dir/all_members.txt"; then
-            any_error=true
-            rm -rf "$dl_dir"
-            continue
-        fi
 
-        rem_members="$dl_dir/members.txt"
-        grep -E "^aroi_validation_${month}[0-9]{2}_[0-9]{6}\.json$" "$dl_dir/all_members.txt" \
-            | LC_ALL=C sort -u > "$rem_members" || true
-
-        to_ext="$dl_dir/to_extract.txt"
-        if [[ "$recover_all_if_present" == "true" ]]; then
-            list_nonempty_validation_files "$snap_dir" > "$dl_dir/have.txt"
-            comm -23 "$rem_members" "$dl_dir/have.txt" > "$to_ext"
-            if [[ -s "$want_file" ]]; then
-                comm -12 "$still_missing" "$rem_members" >> "$to_ext"
-                LC_ALL=C sort -u "$to_ext" -o "$to_ext"
-            fi
-        else
-            comm -12 "$still_missing" "$rem_members" > "$to_ext"
-        fi
-
-        if [[ -s "$to_ext" ]]; then
-            ext_dir="$dl_dir/ext"
-            mkdir -p "$ext_dir"
-            rc=0
-            zstd -dc --long="$ZSTD_DEC_LONG" "$dl_dir/$archive_name" 2>/dev/null \
-                | tar -C "$ext_dir" -xf - -T "$to_ext" 2>/dev/null || rc=$?
-            if [[ $rc -ne 0 ]]; then
+        if [[ "$has_list" == "true" ]]; then
+            if [[ ! -s "$dl_dir/$list_name" ]]; then
                 any_error=true
-                rm -rf "$dl_dir"
-                continue
-            fi
-            local all_ok=true
-            while IFS= read -r fn; do
-                [[ -z "$fn" ]] && continue
-                if [[ ! -f "$ext_dir/$fn" || -L "$ext_dir/$fn" || ! -s "$ext_dir/$fn" ]]; then
-                    all_ok=false
-                    break
+            else
+                grep_rc=0
+                grep -E "^aroi_validation_${month}[0-9]{2}_[0-9]{6}\.json$" "$dl_dir/$list_name" > "$dl_dir/remote_list_entries.txt" || grep_rc=$?
+                if (( grep_rc > 1 )); then
+                    any_error=true
+                elif [[ -s "$dl_dir/remote_list_entries.txt" ]]; then
+                    cat "$dl_dir/remote_list_entries.txt" >> "$required_file"
+                    LC_ALL=C sort -u "$required_file" -o "$required_file"
+                else
+                    any_error=true
                 fi
-            done < "$to_ext"
-            if [[ "$all_ok" != "true" ]]; then
+            fi
+        fi
+
+        list_nonempty_validation_files "$snap_dir" > "$work_dir/snap-cur-${month}.txt" || { rm -rf "$dl_dir"; return 1; }
+        comm -23 "$required_file" "$work_dir/snap-cur-${month}.txt" > "$still_missing"
+
+        if [[ "$has_zst" == "true" ]]; then
+            if [[ ! -s "$dl_dir/$archive_name" ]] \
+                || ! zstd -t --long="$ZSTD_DEC_LONG" "$dl_dir/$archive_name" >/dev/null 2>&1 \
+                || ! list_archive_members "$dl_dir/$archive_name" "$dl_dir/all_members.txt"; then
                 any_error=true
                 rm -rf "$dl_dir"
                 continue
             fi
-            while IFS= read -r fn; do
-                [[ -z "$fn" ]] && continue
-                mv -f "$ext_dir/$fn" "$snap_dir/$fn"
-            done < "$to_ext"
-            echo "  Recovered $(wc -l < "$to_ext" | tr -d '[:space:]') member(s) for $month from $prov backup"
+
+            local rem_members="$dl_dir/members.txt" rem_overlap="$dl_dir/overlap.txt" rc fn
+            grep -E "^aroi_validation_${month}[0-9]{2}_[0-9]{6}\.json$" "$dl_dir/all_members.txt" \
+                | LC_ALL=C sort -u > "$rem_members" || true
+
+            # Check overlapping snapshot/recovered files against the remote archive before rebuilding
+            comm -12 "$work_dir/snap-cur-${month}.txt" "$rem_members" > "$rem_overlap"
+            if [[ -s "$rem_overlap" ]]; then
+                local cmp_dir="$dl_dir/cmp-overlap"
+                mkdir -p "$cmp_dir"
+                rc=0
+                zstd -dc --long="$ZSTD_DEC_LONG" "$dl_dir/$archive_name" 2>/dev/null \
+                    | tar -C "$cmp_dir" -xf - -T "$rem_overlap" 2>/dev/null || rc=$?
+                if [[ $rc -ne 0 ]]; then
+                    any_error=true
+                    rm -rf "$dl_dir"
+                    continue
+                fi
+                while IFS= read -r fn; do
+                    [[ -z "$fn" ]] && continue
+                    if [[ ! -f "$cmp_dir/$fn" || -L "$cmp_dir/$fn" || ! -f "$snap_dir/$fn" || -L "$snap_dir/$fn" ]] \
+                        || ! cmp -s "$snap_dir/$fn" "$cmp_dir/$fn"; then
+                        echo "  ✗ Content conflict for $fn ($month): public/ differs from remote $prov backup; retaining public file"
+                        rm -rf "$dl_dir"
+                        return 1
+                    fi
+                done < "$rem_overlap"
+            fi
+
+            local to_ext="$dl_dir/to_extract.txt"
+            if [[ "$recover_all_if_present" == "true" ]]; then
+                comm -23 "$rem_members" "$work_dir/snap-cur-${month}.txt" > "$to_ext"
+                if [[ -s "$still_missing" ]]; then
+                    comm -12 "$still_missing" "$rem_members" >> "$to_ext"
+                    LC_ALL=C sort -u "$to_ext" -o "$to_ext"
+                fi
+            else
+                comm -12 "$still_missing" "$rem_members" > "$to_ext"
+            fi
+
+            if [[ -s "$to_ext" ]]; then
+                local ext_dir="$dl_dir/ext" all_ok=true
+                mkdir -p "$ext_dir"
+                rc=0
+                zstd -dc --long="$ZSTD_DEC_LONG" "$dl_dir/$archive_name" 2>/dev/null \
+                    | tar -C "$ext_dir" -xf - -T "$to_ext" 2>/dev/null || rc=$?
+                if [[ $rc -ne 0 ]]; then
+                    any_error=true
+                    rm -rf "$dl_dir"
+                    continue
+                fi
+                while IFS= read -r fn; do
+                    [[ -z "$fn" ]] && continue
+                    if [[ ! -f "$ext_dir/$fn" || -L "$ext_dir/$fn" || ! -s "$ext_dir/$fn" ]]; then
+                        all_ok=false
+                        break
+                    fi
+                done < "$to_ext"
+                if [[ "$all_ok" != "true" ]]; then
+                    any_error=true
+                    rm -rf "$dl_dir"
+                    continue
+                fi
+                while IFS= read -r fn; do
+                    [[ -z "$fn" ]] && continue
+                    mv -f "$ext_dir/$fn" "$snap_dir/$fn"
+                done < "$to_ext"
+                echo "  Recovered $(wc -l < "$to_ext" | tr -d '[:space:]') member(s) for $month from $prov backup"
+            fi
         fi
 
         rm -rf "$dl_dir"
 
-        list_nonempty_validation_files "$snap_dir" > "$work_dir/snap-now.txt"
-        comm -23 "$still_missing" "$work_dir/snap-now.txt" > "$work_dir/still-next.txt"
-        mv -f "$work_dir/still-next.txt" "$still_missing"
+        list_nonempty_validation_files "$snap_dir" > "$work_dir/snap-now.txt" || return 1
+        comm -23 "$required_file" "$work_dir/snap-now.txt" > "$still_missing"
     done
 
     if [[ -s "$still_missing" ]]; then
@@ -314,16 +381,17 @@ archive_month() {
     local archive_path="$ARCHIVE_DIR/$archive_name"
     local list_path="$ARCHIVE_DIR/$list_name"
 
-    local work_dir snap_dir snap_verify_dir
+    local work_dir snap_dir snap_verify_dir snap_ident
     work_dir=$(mktemp -d "$STAGE_DIR/compress-${month}.XXXXXX")
     snap_dir="$work_dir/snap"
     snap_verify_dir="$RUN_SNAP_ROOT/$month"
+    snap_ident="$RUN_SNAP_ROOT/${month}.ident"
     mkdir -p "$snap_dir"
-    rm -rf "$snap_verify_dir"
+    rm -rf "$snap_verify_dir" "$snap_ident"
     mkdir -p "$snap_verify_dir"
 
-    if ! snapshot_month_files "$month" "$snap_dir"; then
-        rm -rf "$work_dir" "$snap_verify_dir"
+    if ! snapshot_month_files "$month" "$snap_dir" "$snap_ident"; then
+        rm -rf "$work_dir" "$snap_verify_dir" "$snap_ident"
         return 1
     fi
 
@@ -490,12 +558,23 @@ archive_month() {
         return 1
     fi
 
-    if ! atomic_install_file "$tmp_archive" "$archive_path" 644 \
-        || ! atomic_install_file "$work_dir/expected.txt" "$list_path" 644; then
-        echo "  ✗ Failed installing $archive_name or $list_name"
-        rm -rf "$work_dir"
+    local archive_lock="$LOG_DIR/archive.lock"
+    exec 5>>"$archive_lock"
+    if ! flock -w "$COMPRESS_LOCK_WAIT" 5; then
+        exec 5>&-
+        echo "  ✗ archive.lock still held after ${COMPRESS_LOCK_WAIT}s; cannot install $archive_name"
+        rm -rf "$work_dir" "$snap_verify_dir" "$snap_ident"
         return 1
     fi
+    note_lock_holder "$archive_lock"
+    if ! atomic_install_file "$tmp_archive" "$archive_path" 644 \
+        || ! atomic_install_file "$work_dir/expected.txt" "$list_path" 644; then
+        exec 5>&-
+        echo "  ✗ Failed installing $archive_name or $list_name"
+        rm -rf "$work_dir" "$snap_verify_dir" "$snap_ident"
+        return 1
+    fi
+    exec 5>&-
 
     local archive_size
     archive_size=$(du -sh "$archive_path" 2>/dev/null | cut -f1) || archive_size="?"
@@ -567,11 +646,34 @@ verify_completed_month_provider() {
             fi
         fi
         if [[ -s "$replace_zero" ]]; then
-            echo "  ↻ Replacing $(wc -l < "$replace_zero" | tr -d '[:space:]') confirmed 0-byte object(s) in $provider ($month)..."
-            if ! "$RCLONE" copy "$snap_ref" "$bucket" --files-from "$replace_zero" --no-traverse >/dev/null 2>&1; then
-                echo "  ✗ Zero-byte replacement upload failed for $provider ($month)"
+            local prov_lower upload_lock raw_zero_check fresh_zero still_zero
+            prov_lower=$(printf '%s' "$provider" | tr '[:upper:]' '[:lower:]')
+            upload_lock="$LOG_DIR/upload-${prov_lower}.lock"
+            exec 8>>"$upload_lock"
+            if ! flock -w 300 8; then
+                exec 8>&-
+                echo "  ✗ Upload lock busy after 300s; skipping 0-byte replacement for $provider ($month)"
                 return 1
             fi
+            note_lock_holder "$upload_lock"
+            if ! raw_zero_check=$("$RCLONE" lsf "$bucket" --max-depth 1 --files-only --format sp --include "aroi_validation_${month}*.json" 2>/dev/null); then
+                exec 8>&-
+                echo "  ✗ Failed re-checking 0-byte objects under lock for $provider ($month)"
+                return 1
+            fi
+            fresh_zero="$work_dir/fresh-zero-${provider}-${month}.txt"
+            still_zero="$work_dir/still-zero-${provider}-${month}.txt"
+            printf '%s\n' "$raw_zero_check" | awk -F';' '$1+0 == 0 {print $2}' | { grep -E "$AROI_JSON_REGEX" || true; } | LC_ALL=C sort -u > "$fresh_zero"
+            comm -12 "$replace_zero" "$fresh_zero" > "$still_zero"
+            if [[ -s "$still_zero" ]]; then
+                echo "  ↻ Replacing $(wc -l < "$still_zero" | tr -d '[:space:]') confirmed 0-byte object(s) in $provider ($month)..."
+                if ! "$RCLONE" copy "$snap_ref" "$bucket" --files-from "$still_zero" --no-traverse >/dev/null 2>&1; then
+                    exec 8>&-
+                    echo "  ✗ Zero-byte replacement upload failed for $provider ($month)"
+                    return 1
+                fi
+            fi
+            exec 8>&-
         fi
 
         # Re-verify backfilled non-empty files now exist live remotely
@@ -592,10 +694,11 @@ verify_completed_month_provider() {
 }
 
 # Safely remove uncompressed files for a verified completed month from public/.
-# Under public.lock, checks each file matches the verified snapshot generation before removing.
+# Under public.lock, checks each file's recorded dev:ino and bytes match the verified snapshot.
 prune_completed_month_local() {
     local month=$1 list_file=$2
     local snap_ref="$RUN_SNAP_ROOT/$month"
+    local snap_ident="$RUN_SNAP_ROOT/${month}.ident"
     local removed=0 failed=0 kept_changed=0 fn manifest_rc=0
 
     exec 7>>"$PUBLIC_LOCK"
@@ -606,19 +709,15 @@ prune_completed_month_local() {
     fi
     note_lock_holder "$PUBLIC_LOCK"
 
-    local same_fs=false
-    same_filesystem "$PUBLIC_DIR" "$snap_ref" && same_fs=true
-
     while IFS= read -r fn; do
         [[ "$fn" =~ ^aroi_validation_${month}[0-9]{2}_[0-9]{6}\.json$ ]] || continue
         if [[ -e "$PUBLIC_DIR/$fn" || -L "$PUBLIC_DIR/$fn" ]]; then
-            local generation_matches=false
-            if [[ -f "$PUBLIC_DIR/$fn" && ! -L "$PUBLIC_DIR/$fn" && -f "$snap_ref/$fn" ]]; then
-                if [[ "$same_fs" == "true" ]]; then
-                    if [[ "$PUBLIC_DIR/$fn" -ef "$snap_ref/$fn" ]] && cmp -s "$PUBLIC_DIR/$fn" "$snap_ref/$fn"; then
-                        generation_matches=true
-                    fi
-                elif cmp -s "$PUBLIC_DIR/$fn" "$snap_ref/$fn"; then
+            local generation_matches=false expected_dev_ino="" cur_dev_ino=""
+            if [[ -f "$PUBLIC_DIR/$fn" && ! -L "$PUBLIC_DIR/$fn" && -f "$snap_ref/$fn" && -s "$snap_ident" ]]; then
+                expected_dev_ino=$(awk -F'\t' -v target="$fn" '$2 == target {print $1; exit}' "$snap_ident")
+                cur_dev_ino=$(file_dev_ino "$PUBLIC_DIR/$fn" 2>/dev/null || true)
+                if [[ -n "$expected_dev_ino" && "$cur_dev_ino" == "$expected_dev_ino" ]] \
+                    && cmp -s "$PUBLIC_DIR/$fn" "$snap_ref/$fn"; then
                     generation_matches=true
                 fi
             fi
@@ -631,7 +730,7 @@ prune_completed_month_local() {
                     failed=$((failed + 1))
                 fi
             else
-                echo "  ⚠ Retaining $fn in public/: file modified or added after snapshot verification"
+                echo "  ⚠ Retaining $fn in public/: file modified or replaced after snapshot verification"
                 kept_changed=$((kept_changed + 1))
             fi
         fi

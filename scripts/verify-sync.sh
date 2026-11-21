@@ -69,27 +69,45 @@ list_local_zero() {
     )
 }
 
-# List sorted unique YYYYMM backup months having either a .tar.zst or .list in ARCHIVE_DIR
+# List sorted unique YYYYMM backup months having either a .tar.zst or .list in ARCHIVE_DIR.
+# Writes output to out_file and returns non-zero if ARCHIVE_DIR cannot be scanned.
 list_local_backup_months() {
+    local out_file=$1 raw_find
+    : > "$out_file"
     [[ -d "$ARCHIVE_DIR" ]] || return 0
-    (
-        cd "$ARCHIVE_DIR"
-        find . -maxdepth 1 \( -name 'aroi-*.tar.zst' -o -name 'aroi-*.list' \) -type f 2>/dev/null \
-            | sed -E 's#^\./aroi-([0-9]{6})\.(tar\.zst|list)$#\1#' \
-            | { grep -E '^[0-9]{6}$' || true; } \
-            | LC_ALL=C sort -u
-    )
+    if ! raw_find=$(cd "$ARCHIVE_DIR" && find . -maxdepth 1 \( -name 'aroi-*.tar.zst' -o -name 'aroi-*.list' \) -type f); then
+        return 1
+    fi
+    [[ -n "$raw_find" ]] || return 0
+    printf '%s\n' "$raw_find" \
+        | sed -E 's#^\./aroi-([0-9]{6})\.(tar\.zst|list)$#\1#' \
+        | { grep -E '^[0-9]{6}$' || true; } \
+        | LC_ALL=C sort -u > "$out_file"
 }
 
-# Collect local expected dataset from local-archive/*.list + non-empty public/*.json
+# Collect local expected dataset from local-archive/*.list + non-empty public/*.json.
+# Fails loudly on scan, read, or sort errors so parity/repair never run on a truncated set.
 collect_local_expected() {
-    {
-        local lf
+    local raw_file="$WORK/expected-raw.txt" lists_file="$WORK/expected-lists.bin"
+    local lf grep_rc read_err=0
+    : > "$raw_file"
+    if [[ -d "$ARCHIVE_DIR" ]]; then
+        if ! find "$ARCHIVE_DIR" -maxdepth 1 -name 'aroi-*.list' -type f -print0 > "$lists_file"; then
+            return 1
+        fi
         while IFS= read -r -d '' lf; do
-            grep -E "$AROI_JSON_REGEX" "$lf" 2>/dev/null || true
-        done < <(find "$ARCHIVE_DIR" -maxdepth 1 -name 'aroi-*.list' -type f -print0 2>/dev/null)
-        list_nonempty_validation_files "$PUBLIC_DIR"
-    } | LC_ALL=C sort -u > "$WORK/local-expected.txt"
+            grep_rc=0
+            grep -E "$AROI_JSON_REGEX" "$lf" >> "$raw_file" || grep_rc=$?
+            if (( grep_rc > 1 )); then
+                read_err=1
+                break
+            fi
+        done < "$lists_file"
+        rm -f "$lists_file"
+        (( read_err == 0 )) || return 1
+    fi
+    list_nonempty_validation_files "$PUBLIC_DIR" >> "$raw_file" || return 1
+    LC_ALL=C sort -u "$raw_file" > "$WORK/local-expected.txt" || return 1
 }
 
 # List live JSONs (non-empty and 0-byte separately) + _backups/ (with MD5) from a remote bucket.
@@ -327,8 +345,33 @@ backfill_remote_live() {
         "$RCLONE" copy "$stage" "$target_bucket" --files-from "$ready_absent" --no-traverse --ignore-existing || return 1
     fi
     if [[ -s "$ready_zero" ]]; then
-        echo "  ↻ Replacing $(wc -l < "$ready_zero" | tr -d '[:space:]') confirmed 0-byte live file(s) in $target_name..."
-        "$RCLONE" copy "$stage" "$target_bucket" --files-from "$ready_zero" --no-traverse || return 1
+        local target_lower upload_lock raw_zero_check fresh_zero still_zero
+        target_lower=$(printf '%s' "$target_name" | tr '[:upper:]' '[:lower:]')
+        upload_lock="$LOG_DIR/upload-${target_lower}.lock"
+        exec 8>>"$upload_lock"
+        if ! flock -w 300 8; then
+            exec 8>&-
+            echo "  ✗ Upload lock busy after 300s; skipping 0-byte replacement for $target_name"
+            return 1
+        fi
+        note_lock_holder "$upload_lock"
+        if ! raw_zero_check=$("$RCLONE" lsf "$target_bucket" --max-depth 1 --files-only --format sp 2>/dev/null); then
+            exec 8>&-
+            echo "  ✗ Failed re-checking 0-byte objects under lock for $target_name"
+            return 1
+        fi
+        fresh_zero="$WORK/fresh-zero-${target_name}.txt"
+        still_zero="$WORK/still-zero-${target_name}.txt"
+        printf '%s\n' "$raw_zero_check" | awk -F';' '$1+0 == 0 {print $2}' | { grep -E "$AROI_JSON_REGEX" || true; } | LC_ALL=C sort -u > "$fresh_zero"
+        comm -12 "$ready_zero" "$fresh_zero" > "$still_zero"
+        if [[ -s "$still_zero" ]]; then
+            echo "  ↻ Replacing $(wc -l < "$still_zero" | tr -d '[:space:]') confirmed 0-byte live file(s) in $target_name..."
+            if ! "$RCLONE" copy "$stage" "$target_bucket" --files-from "$still_zero" --no-traverse; then
+                exec 8>&-
+                return 1
+            fi
+        fi
+        exec 8>&-
     fi
 
     # Re-verify full requested missing_file against remote live bucket
@@ -361,27 +404,69 @@ elif [[ -n "$local_zero" ]]; then
     echo "⚠ Local public/ contains 0-byte JSON(s); attempting repair..."
 fi
 
-# 2. Validate local monthly backup pairs (always before remote backup repair; also under --verify-zstd)
+# 2. Validate local monthly backup pairs (always before remote backup repair; also under --verify-zstd).
+# Captures consistent pairs into $WORK/validated-pairs/ under archive.lock so validation, upload,
+# and post-repair rechecks inspect one unchanging generation.
+VALIDATED_PAIR_DIR="$WORK/validated-pairs"
+mkdir -p "$VALIDATED_PAIR_DIR"
+
 validate_local_backup_pairs() {
     : > "$WORK/valid-backup-months.txt"
-    local ym
+    local archive_lock="$LOG_DIR/archive.lock"
+    exec 5>>"$archive_lock"
+    if ! flock -w 300 5; then
+        exec 5>&-
+        echo "✗ archive.lock busy after 300s; cannot snapshot local backup pairs"
+        ERRORS=$((ERRORS + 1))
+        return 1
+    fi
+    note_lock_holder "$archive_lock"
+
+    if ! list_local_backup_months "$WORK/all-backup-months.txt"; then
+        exec 5>&-
+        echo "✗ Failed scanning local archive directory: $ARCHIVE_DIR"
+        ERRORS=$((ERRORS + 1))
+        return 1
+    fi
+
+    local ym name
     while IFS= read -r ym; do
         [[ -z "$ym" ]] && continue
-        if verify_local_backup_pair "$ARCHIVE_DIR" "$ym" "$WORK"; then
+        for name in "aroi-${ym}.tar.zst" "aroi-${ym}.list"; do
+            if [[ -e "$ARCHIVE_DIR/$name" ]]; then
+                ln "$ARCHIVE_DIR/$name" "$VALIDATED_PAIR_DIR/$name" 2>/dev/null \
+                    || cp -p "$ARCHIVE_DIR/$name" "$VALIDATED_PAIR_DIR/$name" || {
+                    exec 5>&-
+                    echo "✗ Failed snapshotting local backup artifact: $ARCHIVE_DIR/$name"
+                    ERRORS=$((ERRORS + 1))
+                    return 1
+                }
+            fi
+        done
+    done < "$WORK/all-backup-months.txt"
+    exec 5>&-
+
+    while IFS= read -r ym; do
+        [[ -z "$ym" ]] && continue
+        if verify_local_backup_pair "$VALIDATED_PAIR_DIR" "$ym" "$WORK"; then
             echo "$ym" >> "$WORK/valid-backup-months.txt"
         else
             ERRORS=$((ERRORS + 1))
         fi
-    done < <(list_local_backup_months)
+    done < "$WORK/all-backup-months.txt"
 }
 
 if $VERIFY_ZSTD || [[ "$DO_ENABLED" == "true" || "$R2_ENABLED" == "true" ]]; then
-    validate_local_backup_pairs
+    validate_local_backup_pairs || true
 else
     : > "$WORK/valid-backup-months.txt"
 fi
 
-collect_local_expected
+if ! collect_local_expected; then
+    echo "✗ Failed collecting local expected dataset; aborting parity checks"
+    ERRORS=$((ERRORS + 1))
+    exit 1
+fi
 expected_count=$(wc -l < "$WORK/local-expected.txt" | tr -d '[:space:]')
 echo "Local expected hourly JSONs: $expected_count"
 
@@ -432,7 +517,11 @@ fi
 # 4a. Check/repair remote -> local extras & local 0-byte files before remote parity backfill
 if $FIX_MODE; then
     repair_local_from_sources "$DO_SCAN_OK" "$R2_SCAN_OK"
-    collect_local_expected
+    if ! collect_local_expected; then
+        echo "✗ Failed re-collecting local expected dataset after repair; aborting parity checks"
+        ERRORS=$((ERRORS + 1))
+        exit 1
+    fi
     expected_count=$(wc -l < "$WORK/local-expected.txt" | tr -d '[:space:]')
     rem_zero=$(list_local_zero)
     if [[ -n "$rem_zero" ]]; then
@@ -489,13 +578,13 @@ check_provider_parity() {
         fi
     fi
 
-    # Verify valid local zstd backup archives & .list manifests in $bucket/_backups/
-    # (corrupt/incomplete local pairs were skipped in validate_local_backup_pairs so healthy remote copies stay safe)
+    # Verify valid local zstd backup archives & .list manifests against $bucket/_backups/
+    # using the locked-captured VALIDATED_PAIR_DIR generation for check, repair upload, and recheck.
     local -a mismatched_months=()
     local ym
     while IFS= read -r ym; do
         [[ -z "$ym" ]] && continue
-        if ! verify_remote_backup_pair "$RCLONE" "$name" "$bucket" "$ym" "$ARCHIVE_DIR" "$backups_file" "$WORK"; then
+        if ! verify_remote_backup_pair "$RCLONE" "$name" "$bucket" "$ym" "$VALIDATED_PAIR_DIR" "$backups_file" "$WORK"; then
             mismatched_months+=("$ym")
         fi
     done < "$WORK/valid-backup-months.txt"
@@ -509,7 +598,7 @@ check_provider_parity() {
                 ERRORS=$((ERRORS + 1))
             else
                 for ym in "${mismatched_months[@]}"; do
-                    if ! "$upload_script" --repair-backups "$ym"; then
+                    if ! "$upload_script" --repair-backups "$ym" "$VALIDATED_PAIR_DIR"; then
                         ERRORS=$((ERRORS + 1))
                         repair_failed=true
                     fi
@@ -518,7 +607,7 @@ check_provider_parity() {
                     local recheck_bk="$WORK/recheck-${name_lower}-backups.txt"
                     if "$RCLONE" lsf "$bucket/_backups/" --max-depth 1 --files-only --format shp > "$recheck_bk" 2>/dev/null; then
                         for ym in "${mismatched_months[@]}"; do
-                            if ! verify_remote_backup_pair "$RCLONE" "$name" "$bucket" "$ym" "$ARCHIVE_DIR" "$recheck_bk" "$WORK"; then
+                            if ! verify_remote_backup_pair "$RCLONE" "$name" "$bucket" "$ym" "$VALIDATED_PAIR_DIR" "$recheck_bk" "$WORK"; then
                                 ERRORS=$((ERRORS + 1))
                             fi
                         done

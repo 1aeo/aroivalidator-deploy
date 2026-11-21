@@ -245,12 +245,12 @@ do_upload() {
     log_success "Upload complete"
 }
 
-# Upload monthly zstd archives and their .list manifests from ARCHIVE_DIR to
-# $bucket/_backups/ (never deletes remote backup objects).
-# Pass force_overwrite=true to include --ignore-times (used for checksum mismatch repair).
+# Upload monthly zstd archives and their .list manifests from ARCHIVE_DIR (or a validated custom dir)
+# to $bucket/_backups/ (never deletes remote backup objects).
+# Pass force_overwrite=true to include --ignore-times after strictly validating each backup pair.
 upload_zstd_backups() {
-    local bucket=$1 month=${2:-} force_overwrite=${3:-false}
-    local work_dir list_file rc=0 count=0 name
+    local bucket=$1 month=${2:-} force_overwrite=${3:-false} custom_dir=${4:-}
+    local work_dir list_file src_dir rc=0 count=0 name
     local -a copy_opts=("${RCLONE_OPTS_ARRAY[@]}")
 
     if [[ "$force_overwrite" == "true" ]]; then
@@ -260,14 +260,107 @@ upload_zstd_backups() {
     if [[ -n "$month" ]]; then
         validate_pattern "$month" '^[0-9]{6}$' "month" || return 1
     fi
-    [[ -d "$ARCHIVE_DIR" ]] || { log_error "Archive directory not found: $ARCHIVE_DIR"; return 1; }
+
+    src_dir="${custom_dir:-$ARCHIVE_DIR}"
+    [[ -d "$src_dir" ]] || { log_error "Archive directory not found: $src_dir"; return 1; }
 
     work_dir=$(mktemp -d "$STAGE_DIR/backup-files.XXXXXX")
     list_file="$work_dir/files.txt"
-    if [[ -n "$month" ]]; then
+    : > "$list_file"
+
+    if [[ "$force_overwrite" == "true" ]]; then
+        local validate_dir="$src_dir"
+        if [[ -z "$custom_dir" ]]; then
+            # Direct --repair-backups invocation: capture consistent pair(s) under archive.lock
+            local pair_dir="$work_dir/pair"
+            mkdir -p "$pair_dir"
+            local archive_lock="$LOG_DIR/archive.lock"
+            exec 5>>"$archive_lock"
+            if ! flock -w 300 5; then
+                exec 5>&-
+                log_error "Archive lock busy after 300s; refusing repair backup upload"
+                rm -rf "$work_dir"
+                return 1
+            fi
+            note_lock_holder "$archive_lock"
+
+            if [[ -n "$month" ]]; then
+                for name in "aroi-${month}.tar.zst" "aroi-${month}.list"; do
+                    if [[ ! -s "$ARCHIVE_DIR/$name" ]]; then
+                        exec 5>&-
+                        log_error "Missing or empty backup artifact: $ARCHIVE_DIR/$name"
+                        rm -rf "$work_dir"
+                        return 1
+                    fi
+                    ln "$ARCHIVE_DIR/$name" "$pair_dir/$name" 2>/dev/null || cp -p "$ARCHIVE_DIR/$name" "$pair_dir/$name" || {
+                        exec 5>&-
+                        rm -rf "$work_dir"
+                        return 1
+                    }
+                done
+            else
+                local raw_cand m
+                if ! raw_cand=$(cd "$ARCHIVE_DIR" && find . -maxdepth 1 \( -name 'aroi-*.tar.zst' -o -name 'aroi-*.list' \) -type f); then
+                    exec 5>&-
+                    rm -rf "$work_dir"
+                    return 1
+                fi
+                if [[ -n "$raw_cand" ]]; then
+                    while IFS= read -r m; do
+                        [[ -z "$m" ]] && continue
+                        for name in "aroi-${m}.tar.zst" "aroi-${m}.list"; do
+                            if [[ ! -s "$ARCHIVE_DIR/$name" ]]; then
+                                exec 5>&-
+                                log_error "Incomplete backup pair for $m ($ARCHIVE_DIR/$name)"
+                                rm -rf "$work_dir"
+                                return 1
+                            fi
+                            ln "$ARCHIVE_DIR/$name" "$pair_dir/$name" 2>/dev/null || cp -p "$ARCHIVE_DIR/$name" "$pair_dir/$name" || {
+                                exec 5>&-
+                                rm -rf "$work_dir"
+                                return 1
+                            }
+                        done
+                    done < <(printf '%s\n' "$raw_cand" | sed -E 's#^\./aroi-([0-9]{6})\.(tar\.zst|list)$#\1#' | { grep -E '^[0-9]{6}$' || true; } | LC_ALL=C sort -u)
+                fi
+            fi
+            exec 5>&-
+            validate_dir="$pair_dir"
+        fi
+
+        src_dir="$validate_dir"
+        if [[ -n "$month" ]]; then
+            if ! verify_local_backup_pair "$src_dir" "$month" "$work_dir"; then
+                rm -rf "$work_dir"
+                return 1
+            fi
+            printf 'aroi-%s.tar.zst\naroi-%s.list\n' "$month" "$month" > "$list_file"
+        else
+            local raw_m m
+            if ! raw_m=$(cd "$src_dir" && find . -maxdepth 1 \( -name 'aroi-*.tar.zst' -o -name 'aroi-*.list' \) -type f); then
+                rm -rf "$work_dir"
+                return 1
+            fi
+            if [[ -n "$raw_m" ]]; then
+                while IFS= read -r m; do
+                    [[ -z "$m" ]] && continue
+                    if ! verify_local_backup_pair "$src_dir" "$m" "$work_dir"; then
+                        rm -rf "$work_dir"
+                        return 1
+                    fi
+                    printf 'aroi-%s.tar.zst\naroi-%s.list\n' "$m" "$m" >> "$list_file"
+                done < <(printf '%s\n' "$raw_m" | sed -E 's#^\./aroi-([0-9]{6})\.(tar\.zst|list)$#\1#' | { grep -E '^[0-9]{6}$' || true; } | LC_ALL=C sort -u)
+            fi
+            if [[ ! -s "$list_file" ]]; then
+                log "No zstd archives found in $src_dir"
+                rm -rf "$work_dir"
+                return 0
+            fi
+        fi
+    elif [[ -n "$month" ]]; then
         for name in "aroi-${month}.tar.zst" "aroi-${month}.list"; do
-            if [[ ! -s "$ARCHIVE_DIR/$name" ]]; then
-                log_error "Missing or empty backup artifact: $ARCHIVE_DIR/$name"
+            if [[ ! -s "$src_dir/$name" ]]; then
+                log_error "Missing or empty backup artifact: $src_dir/$name"
                 rm -rf "$work_dir"
                 return 1
             fi
@@ -275,14 +368,14 @@ upload_zstd_backups() {
         done
     else
         (
-            cd "$ARCHIVE_DIR"
+            cd "$src_dir"
             find . -maxdepth 1 \( -name 'aroi-*.tar.zst' -o -name 'aroi-*.list' \) -type f -size +0c 2>/dev/null \
                 | sed 's|^\./||' \
                 | grep -E '^aroi-[0-9]{6}\.(tar\.zst|list)$' \
                 | LC_ALL=C sort -u || true
         ) > "$list_file"
         if [[ ! -s "$list_file" ]]; then
-            log "No zstd archives found in $ARCHIVE_DIR"
+            log "No zstd archives found in $src_dir"
             rm -rf "$work_dir"
             return 0
         fi
@@ -292,7 +385,7 @@ upload_zstd_backups() {
     [[ "$force_overwrite" == "true" ]] && mode_note=" (repairing mismatched artifacts)"
     count=$(wc -l < "$list_file" | tr -d '[:space:]')
     log "Uploading $count zstd backup artifact(s) → $bucket/_backups/${mode_note}"
-    "$RCLONE" copy "$ARCHIVE_DIR" "$bucket/_backups" \
+    "$RCLONE" copy "$src_dir" "$bucket/_backups" \
         --files-from "$list_file" \
         "${copy_opts[@]}" 2>&1 | rclone_summary || rc=${PIPESTATUS[0]}
     rm -rf "$work_dir"
