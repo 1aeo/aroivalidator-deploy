@@ -46,7 +46,7 @@ init_upload() {
     RCLONE_OPTS_ARRAY=(
         "--transfers=$TRANSFERS" "--checkers=$CHECKERS" "--buffer-size=$BUFFER"
         "--s3-upload-concurrency=$S3_CONC" "--s3-chunk-size=$S3_CHUNK"
-        "--no-traverse" "--stats=10s" "--stats-one-line" "--log-level=NOTICE"
+        "--no-traverse" "--s3-no-check-bucket" "--stats=10s" "--stats-one-line" "--log-level=NOTICE"
         "--retries=5" "--retries-sleep=2s" "--low-level-retries=10"
     )
 }
@@ -141,7 +141,7 @@ ensure_r2_remote() {
         access_key_id="$R2_ACCESS_KEY_ID" \
         secret_access_key="$R2_SECRET_ACCESS_KEY" \
         endpoint="https://${CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com" \
-        acl=private
+        acl=private no_check_bucket=true
 }
 
 # Ensure DigitalOcean Spaces rclone remote is configured.
