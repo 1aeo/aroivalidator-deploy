@@ -1001,8 +1001,8 @@ rm -f "$MOCK_ROOT/r2/test-bucket/aroi_validation_${OLD7}01_000000.json"
 : > "$MOCK_ROOT/r2/test-bucket/aroi_validation_${OLD7}02_000000.json"
 : > "$MOCK_LOG"
 "$DEPLOY/scripts/verify-sync.sh" --fix --verify-zstd >/dev/null
-if grep -Eq 'copy .*aroi-r2:test-bucket .*--s3-no-check-bucket --ignore-existing' "$MOCK_LOG" \
-    && grep -Eq 'copy .*aroi-r2:test-bucket .*--no-traverse --s3-no-check-bucket($| )' "$MOCK_LOG"; then
+if grep -Eq 'copy .*aroi-r2:test-bucket .*--files-from [^ ]*ready-absent-R2\.txt --no-traverse --s3-no-check-bucket --ignore-existing' "$MOCK_LOG" \
+    && grep -Eq 'copy .*aroi-r2:test-bucket .*--files-from [^ ]*still-zero-R2\.txt --no-traverse --s3-no-check-bucket($| )' "$MOCK_LOG"; then
     pass "verify-sync.sh --fix passed --s3-no-check-bucket for backfill and 0-byte replacement"
 else
     fail "verify-sync.sh --fix missing --s3-no-check-bucket"
