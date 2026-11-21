@@ -977,6 +977,61 @@ rm -f "$DEPLOY/public/aroi_validation_${OLD7}03_000000.json"
 "$DEPLOY/scripts/verify-sync.sh" --fix --verify-zstd >/dev/null
 "$DEPLOY/scripts/verify-sync.sh" --verify-zstd >/dev/null
 
+echo "=== 33. R2 S3 copy & remote creation set no-check-bucket ==="
+sec33_day=$(date +%Y%m%d)
+echo '{"r2flag":1}' > "$DEPLOY/public/aroi_validation_${sec33_day}_235900.json"
+: > "$MOCK_LOG"
+"$DEPLOY/scripts/upload-r2.sh" "$DEPLOY/public" >/dev/null
+if grep -Eq 'copy .*aroi-r2:test-bucket .*--s3-no-check-bucket' "$MOCK_LOG"; then
+    pass "upload-r2.sh live upload passed --s3-no-check-bucket"
+else
+    fail "upload-r2.sh live upload missing --s3-no-check-bucket"
+fi
+"$DEPLOY/scripts/upload-do.sh" "$DEPLOY/public" >/dev/null
+
+: > "$MOCK_LOG"
+"$DEPLOY/scripts/upload-r2.sh" --upload-backups "$OLD7" >/dev/null
+if grep -Eq 'copy .*aroi-r2:test-bucket/_backups .*--s3-no-check-bucket' "$MOCK_LOG"; then
+    pass "upload-r2.sh --upload-backups passed --s3-no-check-bucket"
+else
+    fail "upload-r2.sh --upload-backups missing --s3-no-check-bucket"
+fi
+
+rm -f "$MOCK_ROOT/r2/test-bucket/aroi_validation_${OLD7}01_000000.json"
+: > "$MOCK_ROOT/r2/test-bucket/aroi_validation_${OLD7}02_000000.json"
+: > "$MOCK_LOG"
+"$DEPLOY/scripts/verify-sync.sh" --fix --verify-zstd >/dev/null
+still_zero_cmd=$(grep -E 'copy .*aroi-r2:test-bucket .*--files-from [^ ]*still-zero-R2\.txt' "$MOCK_LOG" || true)
+if grep -Eq 'copy .*aroi-r2:test-bucket .*--files-from [^ ]*ready-absent-R2\.txt --no-traverse --s3-no-check-bucket --ignore-existing' "$MOCK_LOG" \
+    && [[ -n "$still_zero_cmd" ]] \
+    && [[ "$still_zero_cmd" == *"--no-traverse"* && "$still_zero_cmd" == *"--s3-no-check-bucket"* && "$still_zero_cmd" != *"--ignore-existing"* ]]; then
+    pass "verify-sync.sh --fix passed --s3-no-check-bucket for backfill and 0-byte replacement"
+else
+    fail "verify-sync.sh --fix missing --s3-no-check-bucket"
+fi
+
+: > "$MOCK_LOG"
+(
+    # shellcheck source=upload-common.sh
+    source "$DEPLOY/scripts/upload-common.sh"
+    # shellcheck disable=SC2034
+    RCLONE="$MOCK_BIN/rclone"
+    # shellcheck disable=SC2034
+    AROI_R2_REMOTE="fresh-r2"
+    # shellcheck disable=SC2034
+    R2_ACCESS_KEY_ID="mock"
+    # shellcheck disable=SC2034
+    R2_SECRET_ACCESS_KEY="mock"
+    # shellcheck disable=SC2034
+    CLOUDFLARE_ACCOUNT_ID="mockacct"
+    ensure_r2_remote >/dev/null
+)
+if grep -Eq 'config create fresh-r2 .*no_check_bucket=true' "$MOCK_LOG"; then
+    pass "ensure_r2_remote passes no_check_bucket=true"
+else
+    fail "ensure_r2_remote missing no_check_bucket=true"
+fi
+
 echo ""
 echo "Summary: $PASS passed, $FAIL failed"
 (( FAIL == 0 ))

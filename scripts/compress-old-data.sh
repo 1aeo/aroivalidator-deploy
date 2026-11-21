@@ -648,7 +648,7 @@ verify_completed_month_provider() {
         comm -23 "$can_backfill" "$remote_zero" > "$append_absent"
 
         if [[ -s "$append_absent" ]]; then
-            if ! "$RCLONE" copy "$snap_ref" "$bucket" --files-from "$append_absent" --no-traverse --ignore-existing >/dev/null 2>&1; then
+            if ! "$RCLONE" copy "$snap_ref" "$bucket" --files-from "$append_absent" --no-traverse --s3-no-check-bucket --ignore-existing >/dev/null 2>&1; then
                 echo "  ✗ Backfill upload failed for $provider ($month)"
                 return 1
             fi
@@ -675,7 +675,7 @@ verify_completed_month_provider() {
             comm -12 "$replace_zero" "$fresh_zero" > "$still_zero"
             if [[ -s "$still_zero" ]]; then
                 echo "  ↻ Replacing $(wc -l < "$still_zero" | tr -d '[:space:]') confirmed 0-byte object(s) in $provider ($month)..."
-                if ! "$RCLONE" copy "$snap_ref" "$bucket" --files-from "$still_zero" --no-traverse >/dev/null 2>&1; then
+                if ! "$RCLONE" copy "$snap_ref" "$bucket" --files-from "$still_zero" --no-traverse --s3-no-check-bucket >/dev/null 2>&1; then
                     exec 8>&-
                     echo "  ✗ Zero-byte replacement upload failed for $provider ($month)"
                     return 1

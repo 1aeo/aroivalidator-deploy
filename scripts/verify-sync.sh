@@ -342,7 +342,7 @@ backfill_remote_live() {
 
     if [[ -s "$ready_absent" ]]; then
         echo "  → Backfilling $(wc -l < "$ready_absent" | tr -d '[:space:]') missing live file(s) to $target_name..."
-        "$RCLONE" copy "$stage" "$target_bucket" --files-from "$ready_absent" --no-traverse --ignore-existing || return 1
+        "$RCLONE" copy "$stage" "$target_bucket" --files-from "$ready_absent" --no-traverse --s3-no-check-bucket --ignore-existing || return 1
     fi
     if [[ -s "$ready_zero" ]]; then
         local target_lower upload_lock raw_zero_check fresh_zero still_zero
@@ -366,7 +366,7 @@ backfill_remote_live() {
         comm -12 "$ready_zero" "$fresh_zero" > "$still_zero"
         if [[ -s "$still_zero" ]]; then
             echo "  ↻ Replacing $(wc -l < "$still_zero" | tr -d '[:space:]') confirmed 0-byte live file(s) in $target_name..."
-            if ! "$RCLONE" copy "$stage" "$target_bucket" --files-from "$still_zero" --no-traverse; then
+            if ! "$RCLONE" copy "$stage" "$target_bucket" --files-from "$still_zero" --no-traverse --s3-no-check-bucket; then
                 exec 8>&-
                 return 1
             fi
