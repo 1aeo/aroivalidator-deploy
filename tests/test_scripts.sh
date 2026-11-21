@@ -30,8 +30,11 @@ assert_file_missing() {
 # Set up temporary workspace with copied deploy scripts + mock rclone
 WORK=$(mktemp -d)
 cleanup() {
-    chmod 755 "$DEPLOY/local-archive" "$WORK/unreadable-archive" "$WORK/unreadable-manifests" "$WORK/unreadable-backups" 2>/dev/null || true
-    rm -rf "$WORK"
+    [[ -z "${DEPLOY:-}" ]] || chmod 755 "$DEPLOY/local-archive" 2>/dev/null || true
+    if [[ -n "${WORK:-}" ]]; then
+        chmod 755 "$WORK/unreadable-archive" "$WORK/unreadable-manifests" "$WORK/unreadable-backups" 2>/dev/null || true
+        rm -rf "$WORK"
+    fi
 }
 trap cleanup EXIT
 
@@ -912,6 +915,67 @@ else
     fail "DO healthy backup modified despite refused --repair-backups"
 fi
 mv "$WORK/sec31-local-old7.tar.zst" "$DEPLOY/local-archive/aroi-${OLD7}.tar.zst"
+
+echo "=== 32. Stale repair generation refused & recovery mv failure propagated ==="
+mkdir -p "$WORK/sec32-stale"
+cp "$DEPLOY/local-archive/aroi-${OLD7}.tar.zst" "$DEPLOY/local-archive/aroi-${OLD7}.list" "$WORK/sec32-stale/"
+echo '{"newgen":1}' > "$DEPLOY/public/aroi_validation_${OLD7}02_000000.json"
+"$DEPLOY/scripts/upload-do.sh" "$DEPLOY/public" >/dev/null
+"$DEPLOY/scripts/upload-r2.sh" "$DEPLOY/public" >/dev/null
+"$DEPLOY/scripts/compress-old-data.sh" --month "$OLD7" >/dev/null
+cp "$MOCK_ROOT/do/test-bucket/_backups/aroi-${OLD7}.tar.zst" "$WORK/sec32-new-do.tar.zst"
+
+# 32a: Repair upload using older captured pair must refuse before --ignore-times
+: > "$MOCK_LOG"
+if "$DEPLOY/scripts/upload-do.sh" --repair-backups "$OLD7" "$WORK/sec32-stale" >/dev/null 2>&1; then
+    fail "upload-do.sh --repair-backups must refuse stale captured generation"
+else
+    pass "upload-do.sh --repair-backups refused stale captured generation"
+fi
+if grep -q -- "--ignore-times" "$MOCK_LOG"; then
+    fail "upload-do.sh --repair-backups invoked --ignore-times for stale generation"
+else
+    pass "upload-do.sh --repair-backups did not invoke --ignore-times for stale generation"
+fi
+if cmp -s "$MOCK_ROOT/do/test-bucket/_backups/aroi-${OLD7}.tar.zst" "$WORK/sec32-new-do.tar.zst"; then
+    pass "DO newer archive untouched after refused stale repair"
+else
+    fail "DO newer archive overwritten by stale repair"
+fi
+
+# 32b: Failed mv while recovering remote .tar.zst (even without remote .list) must fail cleanly
+rm -f "$DEPLOY/local-archive/aroi-${OLD7}.tar.zst" "$DEPLOY/local-archive/aroi-${OLD7}.list" \
+    "$MOCK_ROOT/do/test-bucket/_backups/aroi-${OLD7}.list" \
+    "$MOCK_ROOT/r2/test-bucket/_backups/aroi-${OLD7}.tar.zst" \
+    "$MOCK_ROOT/r2/test-bucket/_backups/aroi-${OLD7}.list"
+echo '{"late03":3}' > "$DEPLOY/public/aroi_validation_${OLD7}03_000000.json"
+mkdir -p "$WORK/mv-fail-bin"
+REAL_MV=$(command -v mv)
+cat > "$WORK/mv-fail-bin/mv" <<EOF
+#!/usr/bin/env bash
+if [[ "\$*" == *"/ext/"* && "\$*" == *"/snap/"* ]]; then
+    echo "simulated mv failure" >&2
+    exit 1
+fi
+exec "$REAL_MV" "\$@"
+EOF
+chmod +x "$WORK/mv-fail-bin/mv"
+if PATH="$WORK/mv-fail-bin:$PATH" "$DEPLOY/scripts/compress-old-data.sh" --month "$OLD7" >/dev/null 2>&1; then
+    fail "compress-old-data.sh must fail when recovery mv into snapshot fails"
+else
+    pass "compress-old-data.sh propagated recovery mv failure cleanly"
+fi
+assert_file_missing "$DEPLOY/local-archive/aroi-${OLD7}.tar.zst" "did not build partial local tarball after recovery mv failure"
+if cmp -s "$MOCK_ROOT/do/test-bucket/_backups/aroi-${OLD7}.tar.zst" "$WORK/sec32-new-do.tar.zst"; then
+    pass "DO archive untouched after recovery mv failure"
+else
+    fail "DO archive overwritten after recovery mv failure"
+fi
+
+rm -f "$DEPLOY/public/aroi_validation_${OLD7}03_000000.json"
+"$DEPLOY/scripts/compress-old-data.sh" --month "$OLD7" >/dev/null
+"$DEPLOY/scripts/verify-sync.sh" --fix --verify-zstd >/dev/null
+"$DEPLOY/scripts/verify-sync.sh" --verify-zstd >/dev/null
 
 echo ""
 echo "Summary: $PASS passed, $FAIL failed"

@@ -350,7 +350,11 @@ recover_remote_archive() {
                 fi
                 while IFS= read -r fn; do
                     [[ -z "$fn" ]] && continue
-                    mv -f "$ext_dir/$fn" "$snap_dir/$fn"
+                    if ! mv -f "$ext_dir/$fn" "$snap_dir/$fn"; then
+                        echo "  ✗ Failed moving recovered $fn into snapshot for $month"
+                        rm -rf "$dl_dir"
+                        return 1
+                    fi
                 done < "$to_ext"
                 echo "  Recovered $(wc -l < "$to_ext" | tr -d '[:space:]') member(s) for $month from $prov backup"
             fi
@@ -469,7 +473,11 @@ archive_month() {
                         rm -rf "$work_dir" "$snap_verify_dir"
                         return 1
                     fi
-                    mv -f "$ext_dir/$fn" "$snap_dir/$fn"
+                    if ! mv -f "$ext_dir/$fn" "$snap_dir/$fn"; then
+                        echo "  ✗ Failed moving existing member $fn into snapshot for $month"
+                        rm -rf "$work_dir" "$snap_verify_dir" "$snap_ident"
+                        return 1
+                    fi
                 done < "$work_dir/missing_from_snap.txt"
             fi
         else

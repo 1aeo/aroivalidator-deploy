@@ -251,6 +251,7 @@ do_upload() {
 upload_zstd_backups() {
     local bucket=$1 month=${2:-} force_overwrite=${3:-false} custom_dir=${4:-}
     local work_dir list_file src_dir rc=0 count=0 name
+    local holding_archive_lock=false
     local -a copy_opts=("${RCLONE_OPTS_ARRAY[@]}")
 
     if [[ "$force_overwrite" == "true" ]]; then
@@ -269,12 +270,12 @@ upload_zstd_backups() {
     : > "$list_file"
 
     if [[ "$force_overwrite" == "true" ]]; then
-        local validate_dir="$src_dir"
+        local validate_dir="$src_dir" archive_lock="$LOG_DIR/archive.lock"
         if [[ -z "$custom_dir" ]]; then
-            # Direct --repair-backups invocation: capture consistent pair(s) under archive.lock
+            # Direct --repair-backups invocation: hold archive.lock across capture, verification,
+            # and repair upload so compress-old-data cannot publish a newer generation underneath it.
             local pair_dir="$work_dir/pair"
             mkdir -p "$pair_dir"
-            local archive_lock="$LOG_DIR/archive.lock"
             exec 5>>"$archive_lock"
             if ! flock -w 300 5; then
                 exec 5>&-
@@ -282,6 +283,7 @@ upload_zstd_backups() {
                 rm -rf "$work_dir"
                 return 1
             fi
+            holding_archive_lock=true
             note_lock_holder "$archive_lock"
 
             if [[ -n "$month" ]]; then
@@ -324,13 +326,13 @@ upload_zstd_backups() {
                     done < <(printf '%s\n' "$raw_cand" | sed -E 's#^\./aroi-([0-9]{6})\.(tar\.zst|list)$#\1#' | { grep -E '^[0-9]{6}$' || true; } | LC_ALL=C sort -u)
                 fi
             fi
-            exec 5>&-
             validate_dir="$pair_dir"
         fi
 
         src_dir="$validate_dir"
         if [[ -n "$month" ]]; then
             if ! verify_local_backup_pair "$src_dir" "$month" "$work_dir"; then
+                [[ "$holding_archive_lock" == "true" ]] && exec 5>&-
                 rm -rf "$work_dir"
                 return 1
             fi
@@ -338,6 +340,7 @@ upload_zstd_backups() {
         else
             local raw_m m
             if ! raw_m=$(cd "$src_dir" && find . -maxdepth 1 \( -name 'aroi-*.tar.zst' -o -name 'aroi-*.list' \) -type f); then
+                [[ "$holding_archive_lock" == "true" ]] && exec 5>&-
                 rm -rf "$work_dir"
                 return 1
             fi
@@ -345,6 +348,7 @@ upload_zstd_backups() {
                 while IFS= read -r m; do
                     [[ -z "$m" ]] && continue
                     if ! verify_local_backup_pair "$src_dir" "$m" "$work_dir"; then
+                        [[ "$holding_archive_lock" == "true" ]] && exec 5>&-
                         rm -rf "$work_dir"
                         return 1
                     fi
@@ -353,9 +357,33 @@ upload_zstd_backups() {
             fi
             if [[ ! -s "$list_file" ]]; then
                 log "No zstd archives found in $src_dir"
+                [[ "$holding_archive_lock" == "true" ]] && exec 5>&-
                 rm -rf "$work_dir"
                 return 0
             fi
+        fi
+
+        if [[ -n "$custom_dir" ]]; then
+            # Custom captured generation (e.g., verify-sync VALIDATED_PAIR_DIR):
+            # hold archive.lock across freshness check + upload so a newer local archive cannot be clobbered.
+            exec 5>>"$archive_lock"
+            if ! flock -w 300 5; then
+                exec 5>&-
+                log_error "Archive lock busy after 300s; refusing repair backup upload"
+                rm -rf "$work_dir"
+                return 1
+            fi
+            holding_archive_lock=true
+            note_lock_holder "$archive_lock"
+            while IFS= read -r name; do
+                [[ -z "$name" ]] && continue
+                if [[ ! -s "$ARCHIVE_DIR/$name" ]] || ! cmp -s "$ARCHIVE_DIR/$name" "$src_dir/$name"; then
+                    exec 5>&-
+                    log_error "Refusing stale repair upload for $name: $ARCHIVE_DIR changed since capture; retry verify-sync"
+                    rm -rf "$work_dir"
+                    return 1
+                fi
+            done < "$list_file"
         fi
     elif [[ -n "$month" ]]; then
         for name in "aroi-${month}.tar.zst" "aroi-${month}.list"; do
@@ -387,7 +415,8 @@ upload_zstd_backups() {
     log "Uploading $count zstd backup artifact(s) → $bucket/_backups/${mode_note}"
     "$RCLONE" copy "$src_dir" "$bucket/_backups" \
         --files-from "$list_file" \
-        "${copy_opts[@]}" 2>&1 | rclone_summary || rc=${PIPESTATUS[0]}
+        "${copy_opts[@]}" 5>&- 2>&1 | rclone_summary || rc=${PIPESTATUS[0]}
+    [[ "$holding_archive_lock" == "true" ]] && exec 5>&-
     rm -rf "$work_dir"
     if [[ $rc -ne 0 ]]; then
         log_error "Backup archive upload to $bucket/_backups failed (rclone exit $rc)"
