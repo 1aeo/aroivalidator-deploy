@@ -134,7 +134,7 @@ seconds without traversing historical objects or `_backups/`.
 |----------------|---------|-----------|
 | `validation.lock` | update + validation + publish | run exits `Already running (... pid N, since T)` |
 | `public.lock` | publish step, `compress-old-data.sh` snapshot/cleanup, upload snapshot (< 1 s) | waits (publish and snapshot 15 min, compress 1 h) |
-| `cron-log.lock` | `run-batch-validation.sh` (shared), `cron.log` rotation (exclusive) | waits up to 5 min so rotation never drops log lines |
+| `cron-log.lock` | `run-batch-validation.sh` (shared), `cron.log` rotation (exclusive) | waits up to 300 s (on timeout, batch warns and runs unlocked, so concurrent rotation could drop lines) |
 | `compress.lock` | `compress-old-data.sh` | duplicate compress exits cleanly |
 | `upload-do.lock`, `upload-r2.lock` | `upload-do.sh`, `upload-r2.sh` | live upload skipped; backup uploads wait up to 5 min |
 | `prune.lock` | `prune-backups.sh` | prune skipped |

@@ -103,6 +103,10 @@ PUBLIC_LOCK="$LOG_DIR/public.lock"
 CURRENT_MONTH=$(date '+%Y%m')
 ERRORS=0
 FAILED_MONTHS=" "
+RUN_SNAP_ROOT=$(mktemp -d "$STAGE_DIR/verified-snaps.XXXXXX")
+# shellcheck disable=SC2329  # invoked via trap
+cleanup_compress() { rm -rf "${RUN_SNAP_ROOT:-}"; }
+trap cleanup_compress EXIT
 declare -a ARCHIVED_MONTHS=()
 declare -a COMPLETED_CANDIDATES=()
 
@@ -185,12 +189,20 @@ recover_remote_archive() {
 
     local -a providers=()
     local -a buckets=()
-    local b
-    if [[ "$DO_ENABLED" == "true" ]] && b=$(resolve_do_bucket); then
-        providers+=("DO"); buckets+=("$b")
+    local b any_error=false
+    if [[ "$DO_ENABLED" == "true" ]]; then
+        if b=$(resolve_do_bucket); then
+            providers+=("DO"); buckets+=("$b")
+        else
+            any_error=true
+        fi
     fi
-    if [[ "$R2_ENABLED" == "true" ]] && b=$(resolve_r2_bucket); then
-        providers+=("R2"); buckets+=("$b")
+    if [[ "$R2_ENABLED" == "true" ]]; then
+        if b=$(resolve_r2_bucket); then
+            providers+=("R2"); buckets+=("$b")
+        else
+            any_error=true
+        fi
     fi
     if (( ${#providers[@]} == 0 )); then
         [[ "$recover_all_if_present" != "true" && ! -s "$still_missing" ]] && return 0
@@ -198,7 +210,7 @@ recover_remote_archive() {
     fi
 
     local archive_name="aroi-${month}.tar.zst"
-    local remote_seen=false remote_verified=false idx prov bucket
+    local idx prov bucket
     local dl_dir ext_dir lsf_out rem_members to_ext rc fn
 
     for idx in "${!providers[@]}"; do
@@ -209,21 +221,22 @@ recover_remote_archive() {
         fi
 
         if ! lsf_out=$("$RCLONE" lsf "$bucket/_backups/" --max-depth 1 --files-only --include "$archive_name" 2>/dev/null); then
-            remote_seen=true
+            any_error=true
             continue
         fi
         [[ -n "$lsf_out" ]] || continue
-        remote_seen=true
 
         dl_dir=$(mktemp -d "$work_dir/recover-${prov}-${month}.XXXXXX")
         printf '%s\n' "$archive_name" > "$dl_dir/want.txt"
         if ! "$RCLONE" copy "$bucket/_backups" "$dl_dir" --files-from "$dl_dir/want.txt" --no-traverse >/dev/null 2>&1; then
+            any_error=true
             rm -rf "$dl_dir"
             continue
         fi
         if [[ ! -s "$dl_dir/$archive_name" ]] \
             || ! zstd -t --long="$ZSTD_DEC_LONG" "$dl_dir/$archive_name" >/dev/null 2>&1 \
             || ! list_archive_members "$dl_dir/$archive_name" "$dl_dir/all_members.txt"; then
+            any_error=true
             rm -rf "$dl_dir"
             continue
         fi
@@ -251,18 +264,20 @@ recover_remote_archive() {
             zstd -dc --long="$ZSTD_DEC_LONG" "$dl_dir/$archive_name" 2>/dev/null \
                 | tar -C "$ext_dir" -xf - -T "$to_ext" 2>/dev/null || rc=$?
             if [[ $rc -ne 0 ]]; then
+                any_error=true
                 rm -rf "$dl_dir"
                 continue
             fi
             local all_ok=true
             while IFS= read -r fn; do
                 [[ -z "$fn" ]] && continue
-                if [[ ! -s "$ext_dir/$fn" ]]; then
+                if [[ ! -f "$ext_dir/$fn" || -L "$ext_dir/$fn" || ! -s "$ext_dir/$fn" ]]; then
                     all_ok=false
                     break
                 fi
             done < "$to_ext"
             if [[ "$all_ok" != "true" ]]; then
+                any_error=true
                 rm -rf "$dl_dir"
                 continue
             fi
@@ -273,7 +288,6 @@ recover_remote_archive() {
             echo "  Recovered $(wc -l < "$to_ext" | tr -d '[:space:]') member(s) for $month from $prov backup"
         fi
 
-        remote_verified=true
         rm -rf "$dl_dir"
 
         list_nonempty_validation_files "$snap_dir" > "$work_dir/snap-now.txt"
@@ -284,7 +298,7 @@ recover_remote_archive() {
     if [[ -s "$still_missing" ]]; then
         return 1
     fi
-    if [[ "$recover_all_if_present" == "true" && "$remote_seen" == "true" && "$remote_verified" != "true" ]]; then
+    if [[ "$recover_all_if_present" == "true" && "$any_error" == "true" ]]; then
         return 1
     fi
     return 0
@@ -300,17 +314,30 @@ archive_month() {
     local archive_path="$ARCHIVE_DIR/$archive_name"
     local list_path="$ARCHIVE_DIR/$list_name"
 
-    local work_dir snap_dir
+    local work_dir snap_dir snap_verify_dir
     work_dir=$(mktemp -d "$STAGE_DIR/compress-${month}.XXXXXX")
     snap_dir="$work_dir/snap"
+    snap_verify_dir="$RUN_SNAP_ROOT/$month"
     mkdir -p "$snap_dir"
+    rm -rf "$snap_verify_dir"
+    mkdir -p "$snap_verify_dir"
 
     if ! snapshot_month_files "$month" "$snap_dir"; then
-        rm -rf "$work_dir"
+        rm -rf "$work_dir" "$snap_verify_dir"
         return 1
     fi
 
     list_nonempty_validation_files "$snap_dir" > "$work_dir/snap.txt"
+    local fn rc
+    while IFS= read -r fn; do
+        [[ -z "$fn" ]] && continue
+        if ! ln "$snap_dir/$fn" "$snap_verify_dir/$fn" 2>/dev/null && ! cp -p "$snap_dir/$fn" "$snap_verify_dir/$fn"; then
+            echo "  ✗ Failed retaining verification snapshot for $fn"
+            rm -rf "$work_dir" "$snap_verify_dir"
+            return 1
+        fi
+    done < "$work_dir/snap.txt"
+
     if [[ -s "$list_path" ]]; then
         grep -E "^aroi_validation_${month}[0-9]{2}_[0-9]{6}\.json$" "$list_path" 2>/dev/null \
             | LC_ALL=C sort -u > "$work_dir/prev_list.txt" || true
@@ -318,7 +345,7 @@ archive_month() {
         : > "$work_dir/prev_list.txt"
     fi
 
-    local archive_valid=false rc fn
+    local archive_valid=false
     : > "$work_dir/archive_members.txt"
 
     # Preserve any previously archived members not currently in public/
@@ -329,6 +356,31 @@ archive_month() {
             archive_valid=true
             grep -E "^aroi_validation_${month}[0-9]{2}_[0-9]{6}\.json$" "$work_dir/archive_members.txt" \
                 | LC_ALL=C sort -u > "$work_dir/existing.txt" || true
+
+            # Verify no public/ file silently diverges in content under an already-archived filename
+            comm -12 "$work_dir/snap.txt" "$work_dir/existing.txt" > "$work_dir/overlap.txt"
+            if [[ -s "$work_dir/overlap.txt" ]]; then
+                local cmp_dir="$work_dir/overlap-cmp"
+                mkdir -p "$cmp_dir"
+                rc=0
+                zstd -dc --long="$ZSTD_DEC_LONG" "$archive_path" 2>/dev/null \
+                    | tar -C "$cmp_dir" -xf - -T "$work_dir/overlap.txt" 2>/dev/null || rc=$?
+                if [[ $rc -ne 0 ]]; then
+                    echo "  ✗ Failed reading archived copies to verify overlapping files for $month"
+                    rm -rf "$work_dir" "$snap_verify_dir"
+                    return 1
+                fi
+                while IFS= read -r fn; do
+                    [[ -z "$fn" ]] && continue
+                    if [[ ! -f "$cmp_dir/$fn" || -L "$cmp_dir/$fn" || ! -f "$snap_dir/$fn" || -L "$snap_dir/$fn" ]] \
+                        || ! cmp -s "$snap_dir/$fn" "$cmp_dir/$fn"; then
+                        echo "  ✗ Content conflict for $fn ($month): public/ differs from existing $archive_name; retaining public file"
+                        rm -rf "$work_dir" "$snap_verify_dir"
+                        return 1
+                    fi
+                done < "$work_dir/overlap.txt"
+            fi
+
             comm -23 "$work_dir/existing.txt" "$work_dir/snap.txt" > "$work_dir/missing_from_snap.txt"
             if [[ -s "$work_dir/missing_from_snap.txt" ]]; then
                 local ext_dir="$work_dir/existing-ext"
@@ -339,14 +391,14 @@ archive_month() {
                     | tar -C "$ext_dir" -xf - -T "$work_dir/missing_from_snap.txt" 2>/dev/null || rc=$?
                 if [[ $rc -ne 0 ]]; then
                     echo "  ✗ Failed extracting existing members from $archive_name"
-                    rm -rf "$work_dir"
+                    rm -rf "$work_dir" "$snap_verify_dir"
                     return 1
                 fi
                 while IFS= read -r fn; do
                     [[ -z "$fn" ]] && continue
-                    if [[ ! -s "$ext_dir/$fn" ]]; then
-                        echo "  ✗ Extracted empty or missing member $fn from $archive_name"
-                        rm -rf "$work_dir"
+                    if [[ ! -f "$ext_dir/$fn" || -L "$ext_dir/$fn" || ! -s "$ext_dir/$fn" ]]; then
+                        echo "  ✗ Extracted invalid/empty member $fn from $archive_name"
+                        rm -rf "$work_dir" "$snap_verify_dir"
                         return 1
                     fi
                     mv -f "$ext_dir/$fn" "$snap_dir/$fn"
@@ -358,16 +410,24 @@ archive_month() {
             if [[ -s "$work_dir/lost_members.txt" ]]; then
                 if ! recover_remote_archive "$month" "$work_dir/lost_members.txt" "$snap_dir" "$work_dir" "false"; then
                     echo "  ✗ Cannot recover missing previously archived member(s) for $month; refusing partial rebuild"
-                    rm -rf "$work_dir"
+                    rm -rf "$work_dir" "$snap_verify_dir"
                     return 1
                 fi
             elif [[ ! -s "$work_dir/prev_list.txt" ]]; then
                 if ! recover_remote_archive "$month" "$work_dir/lost_members.txt" "$snap_dir" "$work_dir" "true"; then
                     echo "  ✗ Cannot verify/recover remote backup for $month after corrupt local archive"
-                    rm -rf "$work_dir"
+                    rm -rf "$work_dir" "$snap_verify_dir"
                     return 1
                 fi
             fi
+        fi
+    elif [[ ! -s "$work_dir/prev_list.txt" && "$NO_UPLOAD" != "true" ]] && [[ "$DO_ENABLED" == "true" || "$R2_ENABLED" == "true" ]]; then
+        # Both local artifacts are missing/empty: verify remote _backups/ has no prior archive before first build
+        : > "$work_dir/lost_members.txt"
+        if ! recover_remote_archive "$month" "$work_dir/lost_members.txt" "$snap_dir" "$work_dir" "true"; then
+            echo "  ✗ Cannot verify remote backup history for $month while local archive artifacts are absent"
+            rm -rf "$work_dir" "$snap_verify_dir"
+            return 1
         fi
     fi
 
@@ -378,14 +438,14 @@ archive_month() {
     if [[ -s "$work_dir/still_missing.txt" ]]; then
         if ! recover_remote_archive "$month" "$work_dir/still_missing.txt" "$snap_dir" "$work_dir" "false"; then
             echo "  ✗ Local $list_name lists $(wc -l < "$work_dir/still_missing.txt" | tr -d '[:space:]') member(s) absent from snapshot and recovery"
-            rm -rf "$work_dir"
+            rm -rf "$work_dir" "$snap_verify_dir"
             return 1
         fi
         list_nonempty_validation_files "$snap_dir" > "$work_dir/expected.txt"
     fi
 
     if [[ ! -s "$work_dir/expected.txt" ]]; then
-        rm -rf "$work_dir"
+        rm -rf "$work_dir" "$snap_verify_dir"
         return 0
     fi
 
@@ -474,22 +534,23 @@ fetch_remote_state() {
 verify_completed_month_provider() {
     local provider=$1 bucket=$2 month=$3 list_file=$4
     local remote_live=$5 remote_zero=$6 remote_backups=$7 work_dir=$8
+    local snap_ref="$RUN_SNAP_ROOT/$month"
     local missing_file="$work_dir/missing-${provider}-${month}.txt"
 
     comm -23 "$list_file" "$remote_live" > "$missing_file"
     if [[ -s "$missing_file" ]]; then
         local missing_count
         missing_count=$(wc -l < "$missing_file" | tr -d '[:space:]')
-        echo "  ⚠ $provider missing $missing_count non-empty live file(s) for $month; attempting backfill from public/..."
+        echo "  ⚠ $provider missing $missing_count non-empty live file(s) for $month; attempting backfill from verified snapshot..."
         local can_backfill="$work_dir/backfill-${provider}-${month}.txt"
         : > "$can_backfill"
         local fn
         while IFS= read -r fn; do
-            [[ -s "$PUBLIC_DIR/$fn" ]] && echo "$fn" >> "$can_backfill"
+            [[ -f "$snap_ref/$fn" && ! -L "$snap_ref/$fn" && -s "$snap_ref/$fn" ]] && echo "$fn" >> "$can_backfill"
         done < "$missing_file"
 
         if [[ ! -s "$can_backfill" ]] || [[ $(wc -l < "$can_backfill") -ne "$missing_count" ]]; then
-            echo "  ✗ Cannot backfill all missing files from public/ for $provider ($month)"
+            echo "  ✗ Cannot backfill all missing files from verified snapshot for $provider ($month)"
             return 1
         fi
         LC_ALL=C sort -u "$can_backfill" -o "$can_backfill"
@@ -500,14 +561,14 @@ verify_completed_month_provider() {
         comm -23 "$can_backfill" "$remote_zero" > "$append_absent"
 
         if [[ -s "$append_absent" ]]; then
-            if ! "$RCLONE" copy "$PUBLIC_DIR" "$bucket" --files-from "$append_absent" --no-traverse --ignore-existing >/dev/null 2>&1; then
+            if ! "$RCLONE" copy "$snap_ref" "$bucket" --files-from "$append_absent" --no-traverse --ignore-existing >/dev/null 2>&1; then
                 echo "  ✗ Backfill upload failed for $provider ($month)"
                 return 1
             fi
         fi
         if [[ -s "$replace_zero" ]]; then
             echo "  ↻ Replacing $(wc -l < "$replace_zero" | tr -d '[:space:]') confirmed 0-byte object(s) in $provider ($month)..."
-            if ! "$RCLONE" copy "$PUBLIC_DIR" "$bucket" --files-from "$replace_zero" --no-traverse >/dev/null 2>&1; then
+            if ! "$RCLONE" copy "$snap_ref" "$bucket" --files-from "$replace_zero" --no-traverse >/dev/null 2>&1; then
                 echo "  ✗ Zero-byte replacement upload failed for $provider ($month)"
                 return 1
             fi
@@ -531,9 +592,11 @@ verify_completed_month_provider() {
 }
 
 # Safely remove uncompressed files for a verified completed month from public/.
+# Under public.lock, checks each file matches the verified snapshot generation before removing.
 prune_completed_month_local() {
     local month=$1 list_file=$2
-    local removed=0 failed=0 fn manifest_rc=0
+    local snap_ref="$RUN_SNAP_ROOT/$month"
+    local removed=0 failed=0 kept_changed=0 fn manifest_rc=0
 
     exec 7>>"$PUBLIC_LOCK"
     if ! flock -w "$COMPRESS_LOCK_WAIT" 7; then
@@ -543,14 +606,33 @@ prune_completed_month_local() {
     fi
     note_lock_holder "$PUBLIC_LOCK"
 
+    local same_fs=false
+    same_filesystem "$PUBLIC_DIR" "$snap_ref" && same_fs=true
+
     while IFS= read -r fn; do
         [[ "$fn" =~ ^aroi_validation_${month}[0-9]{2}_[0-9]{6}\.json$ ]] || continue
-        if [[ -e "$PUBLIC_DIR/$fn" ]]; then
-            if rm -f "$PUBLIC_DIR/$fn"; then
-                removed=$((removed + 1))
+        if [[ -e "$PUBLIC_DIR/$fn" || -L "$PUBLIC_DIR/$fn" ]]; then
+            local generation_matches=false
+            if [[ -f "$PUBLIC_DIR/$fn" && ! -L "$PUBLIC_DIR/$fn" && -f "$snap_ref/$fn" ]]; then
+                if [[ "$same_fs" == "true" ]]; then
+                    if [[ "$PUBLIC_DIR/$fn" -ef "$snap_ref/$fn" ]] && cmp -s "$PUBLIC_DIR/$fn" "$snap_ref/$fn"; then
+                        generation_matches=true
+                    fi
+                elif cmp -s "$PUBLIC_DIR/$fn" "$snap_ref/$fn"; then
+                    generation_matches=true
+                fi
+            fi
+
+            if [[ "$generation_matches" == "true" ]]; then
+                if rm -f "$PUBLIC_DIR/$fn"; then
+                    removed=$((removed + 1))
+                else
+                    echo "  ✗ Failed removing $PUBLIC_DIR/$fn"
+                    failed=$((failed + 1))
+                fi
             else
-                echo "  ✗ Failed removing $PUBLIC_DIR/$fn"
-                failed=$((failed + 1))
+                echo "  ⚠ Retaining $fn in public/: file modified or added after snapshot verification"
+                kept_changed=$((kept_changed + 1))
             fi
         fi
     done < "$list_file"
@@ -558,8 +640,8 @@ prune_completed_month_local() {
     build_files_manifest "$PUBLIC_DIR" "$ARCHIVE_DIR" "$STAGE_DIR" || manifest_rc=$?
     exec 7>&-
 
-    if (( failed > 0 )) || [[ $manifest_rc -ne 0 ]]; then
-        echo "  ✗ Local cleanup incomplete for $month (removed=$removed, failed=$failed, manifest_rc=$manifest_rc)"
+    if (( failed > 0 || kept_changed > 0 )) || [[ $manifest_rc -ne 0 ]]; then
+        echo "  ✗ Local cleanup incomplete for $month (removed=$removed, retained=$kept_changed, failed=$failed, manifest_rc=$manifest_rc)"
         return 1
     fi
 
@@ -633,12 +715,8 @@ if [[ "$NO_UPLOAD" != "true" ]] && [[ ${#COMPLETED_CANDIDATES[@]} -gt 0 ]]; then
         if [[ "$REMOTE_OK" == "true" ]]; then
             for MONTH in "${COMPLETED_CANDIDATES[@]}"; do
                 is_month_failed "$MONTH" && continue
-                ARCHIVE_PATH="$ARCHIVE_DIR/aroi-${MONTH}.tar.zst"
                 LIST_PATH="$ARCHIVE_DIR/aroi-${MONTH}.list"
-                if [[ ! -s "$ARCHIVE_PATH" || ! -s "$LIST_PATH" ]] \
-                    || ! zstd -t --long="$ZSTD_DEC_LONG" "$ARCHIVE_PATH" >/dev/null 2>&1 \
-                    || ! list_archive_members "$ARCHIVE_PATH" "$VERIFY_WORK/local-members-${MONTH}.txt" \
-                    || ! cmp -s "$LIST_PATH" "$VERIFY_WORK/local-members-${MONTH}.txt"; then
+                if ! verify_local_backup_pair "$ARCHIVE_DIR" "$MONTH" "$VERIFY_WORK"; then
                     echo "  ✗ Local verification failed for $MONTH; keeping files in public/"
                     ERRORS=$((ERRORS + 1))
                     continue

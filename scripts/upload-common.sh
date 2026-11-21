@@ -247,9 +247,15 @@ do_upload() {
 
 # Upload monthly zstd archives and their .list manifests from ARCHIVE_DIR to
 # $bucket/_backups/ (never deletes remote backup objects).
+# Pass force_overwrite=true to include --ignore-times (used for checksum mismatch repair).
 upload_zstd_backups() {
-    local bucket=$1 month=${2:-}
+    local bucket=$1 month=${2:-} force_overwrite=${3:-false}
     local work_dir list_file rc=0 count=0 name
+    local -a copy_opts=("${RCLONE_OPTS_ARRAY[@]}")
+
+    if [[ "$force_overwrite" == "true" ]]; then
+        copy_opts+=("--ignore-times")
+    fi
 
     if [[ -n "$month" ]]; then
         validate_pattern "$month" '^[0-9]{6}$' "month" || return 1
@@ -282,11 +288,13 @@ upload_zstd_backups() {
         fi
     fi
 
+    local mode_note=""
+    [[ "$force_overwrite" == "true" ]] && mode_note=" (repairing mismatched artifacts)"
     count=$(wc -l < "$list_file" | tr -d '[:space:]')
-    log "Uploading $count zstd backup artifact(s) → $bucket/_backups/"
+    log "Uploading $count zstd backup artifact(s) → $bucket/_backups/${mode_note}"
     "$RCLONE" copy "$ARCHIVE_DIR" "$bucket/_backups" \
         --files-from "$list_file" \
-        "${RCLONE_OPTS_ARRAY[@]}" 2>&1 | rclone_summary || rc=${PIPESTATUS[0]}
+        "${copy_opts[@]}" 2>&1 | rclone_summary || rc=${PIPESTATUS[0]}
     rm -rf "$work_dir"
     if [[ $rc -ne 0 ]]; then
         log_error "Backup archive upload to $bucket/_backups failed (rclone exit $rc)"

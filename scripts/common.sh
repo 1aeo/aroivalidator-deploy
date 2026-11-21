@@ -363,6 +363,36 @@ list_nonempty_validation_files() {
     )
 }
 
+# Verify a local monthly backup pair (.tar.zst and .list) exists, is non-empty, passes zstd -t,
+# and has exact member parity against .list (writes diagnostic reason on stdout on failure).
+verify_local_backup_pair() {
+    local archive_dir=$1 month=$2 work_dir=$3
+    local label=${4:-aroi-${month}.tar.zst}
+    local zst="$archive_dir/aroi-${month}.tar.zst"
+    local lst="$archive_dir/aroi-${month}.list"
+    local dec_long actual_members
+
+    if [[ ! -s "$zst" || ! -s "$lst" ]]; then
+        echo "✗ Incomplete or empty local backup pair for $month ($label)"
+        return 1
+    fi
+    dec_long=$(zstd_decode_long "${ZSTD_LONG:-27}")
+    if ! zstd -t --long="$dec_long" "$zst" >/dev/null 2>&1; then
+        echo "✗ Corrupt zstd archive: $label"
+        return 1
+    fi
+    actual_members="$work_dir/.aroi-members-${month}.txt"
+    if ! list_archive_members "$zst" "$actual_members"; then
+        echo "✗ Failed reading archive members from $label"
+        return 1
+    fi
+    if ! cmp -s "$lst" "$actual_members"; then
+        echo "✗ Manifest mismatch for $label vs aroi-${month}.list"
+        return 1
+    fi
+    return 0
+}
+
 # Build public/files.json atomically on public_dir's own filesystem as a newest-first
 # flat JSON array combining:
 #   - all archived filenames listed in <archive_dir>/aroi-*.list
@@ -372,19 +402,31 @@ build_files_manifest() {
     local public_dir=$1 archive_dir=$2 _stage_dir=${3:-}
     mkdir -p "$public_dir"
 
-    local tmp_names tmp_manifest
-    tmp_names=$(mktemp "$public_dir/.aroi-tmp.names.XXXXXX") || return 1
-    tmp_manifest=$(mktemp "$public_dir/.aroi-tmp.files.XXXXXX") || { rm -f "$tmp_names"; return 1; }
+    local tmp_raw tmp_names tmp_manifest
+    tmp_raw=$(mktemp "$public_dir/.aroi-tmp.raw.XXXXXX") || return 1
+    tmp_names=$(mktemp "$public_dir/.aroi-tmp.names.XXXXXX") || { rm -f "$tmp_raw"; return 1; }
+    tmp_manifest=$(mktemp "$public_dir/.aroi-tmp.files.XXXXXX") || { rm -f "$tmp_raw" "$tmp_names"; return 1; }
 
-    {
-        if [[ -d "$archive_dir" ]]; then
-            local list_file
-            while IFS= read -r -d '' list_file; do
-                grep -E "$AROI_JSON_REGEX" "$list_file" 2>/dev/null || true
-            done < <(find "$archive_dir" -maxdepth 1 -name 'aroi-*.list' -type f -print0 2>/dev/null)
-        fi
-        list_nonempty_validation_files "$public_dir"
-    } | LC_ALL=C sort -ru > "$tmp_names"
+    : > "$tmp_raw"
+    if [[ -d "$archive_dir" ]]; then
+        local list_file
+        while IFS= read -r -d '' list_file; do
+            if ! { grep -E "$AROI_JSON_REGEX" "$list_file" 2>/dev/null || true; } >> "$tmp_raw"; then
+                rm -f "$tmp_raw" "$tmp_names" "$tmp_manifest"
+                return 1
+            fi
+        done < <(find "$archive_dir" -maxdepth 1 -name 'aroi-*.list' -type f -print0 2>/dev/null)
+    fi
+    if ! list_nonempty_validation_files "$public_dir" >> "$tmp_raw"; then
+        rm -f "$tmp_raw" "$tmp_names" "$tmp_manifest"
+        return 1
+    fi
+
+    if ! LC_ALL=C sort -ru "$tmp_raw" > "$tmp_names"; then
+        rm -f "$tmp_raw" "$tmp_names" "$tmp_manifest"
+        return 1
+    fi
+    rm -f "$tmp_raw"
 
     if ! jq -Rs 'split("\n") | map(select(length > 0))' < "$tmp_names" > "$tmp_manifest"; then
         rm -f "$tmp_names" "$tmp_manifest"

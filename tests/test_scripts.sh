@@ -292,8 +292,8 @@ echo '{"cur":1}' > "$DEPLOY/public/aroi_validation_${CUR_YM}01_000000.json"
 # Upload OLD_YM to DO only (NOT R2) first -> compress-old-data.sh auto-backfills R2 from public/ then removes OLD_YM!
 "$DEPLOY/scripts/upload-do.sh" "$DEPLOY/public" >/dev/null
 
-# If R2 listing fails during verification, safety gate MUST keep local completed-month files
-if MOCK_RCLONE_FAIL_PATTERN="lsf aroi-r2:test-bucket" "$DEPLOY/scripts/compress-old-data.sh" --daily >/dev/null 2>&1; then
+# If R2 live listing fails during verification, safety gate MUST keep local completed-month files
+if MOCK_RCLONE_FAIL_PATTERN="lsf aroi-r2:test-bucket --max-depth 1 --files-only --format sp" "$DEPLOY/scripts/compress-old-data.sh" --daily >/dev/null 2>&1; then
     fail "compress-old-data.sh should report failure when R2 verification fails"
 else
     pass "compress-old-data.sh blocked completed-month deletion when R2 verification failed"
@@ -416,8 +416,8 @@ sed 's/^DO_SPACES_BUCKET=.*/DO_SPACES_BUCKET=test-bucket/' "$DEPLOY/config.env" 
 mv -f "$DEPLOY/config.env.new" "$DEPLOY/config.env" && chmod 600 "$DEPLOY/config.env"
 "$DEPLOY/scripts/upload-do.sh" "$DEPLOY/public" >/dev/null
 "$DEPLOY/scripts/upload-do.sh" --upload-backups >/dev/null
-top_tmp_count=$(find "$DEPLOY/tmp" -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d '[:space:]')
-assert_eq "$top_tmp_count" "0" "upload_zstd_backups left no top-level files in tmp/"
+top_tmp_count=$(find "$DEPLOY/tmp" -maxdepth 1 \( -type f -o -name 'backup-files.*' \) 2>/dev/null | wc -l | tr -d '[:space:]')
+assert_eq "$top_tmp_count" "0" "upload_zstd_backups left no top-level files or backup-files.* dirs in tmp/"
 
 echo "=== 10. Marker discipline (--no-upload, --month, failed --daily attempt limit) ==="
 rm -f "$DEPLOY/logs/last-archive-date" "$DEPLOY/logs/last-archive-attempt-date"
@@ -668,6 +668,151 @@ if (( cron_after_sz < 1048576 )); then
     pass "cron.log truncated cleanly after rotation (${cron_after_sz} bytes)"
 else
     fail "cron.log was not truncated after rotation (${cron_after_sz} bytes)"
+fi
+
+echo "=== 22. Rejected prune-backups bounds preserve actual input in error message ==="
+keep_err=""
+keep_rc=0
+keep_err=$("$DEPLOY/scripts/prune-backups.sh" --keep 18446744073709551616 2>&1) || keep_rc=$?
+if [[ $keep_rc -eq 2 ]] && grep -q "18446744073709551616" <<< "$keep_err"; then
+    pass "prune-backups.sh error included rejected --keep value"
+else
+    fail "prune-backups.sh error omitted rejected --keep value: $keep_err"
+fi
+env_keep_err=""
+env_keep_rc=0
+env_keep_err=$(KEEP_LEGACY_BACKUPS=18446744073709551616 "$DEPLOY/scripts/prune-backups.sh" 2>&1) || env_keep_rc=$?
+if [[ $env_keep_rc -eq 2 ]] && grep -q "18446744073709551616" <<< "$env_keep_err"; then
+    pass "prune-backups.sh error included rejected KEEP_LEGACY_BACKUPS env value"
+else
+    fail "prune-backups.sh error omitted rejected KEEP_LEGACY_BACKUPS value: $env_keep_err"
+fi
+
+echo "=== 23. Missing local archive+list checks remote history before first-time build ==="
+OLD6="202604"
+echo '{"m4a":1}' > "$DEPLOY/public/aroi_validation_${OLD6}01_000000.json"
+"$DEPLOY/scripts/upload-do.sh" "$DEPLOY/public" >/dev/null
+"$DEPLOY/scripts/upload-r2.sh" "$DEPLOY/public" >/dev/null
+"$DEPLOY/scripts/compress-old-data.sh" --month "$OLD6" >/dev/null
+
+# Wipe local archive+list while remote _backups/ still holds m4a, then add late m4b
+rm -f "$DEPLOY/local-archive/aroi-${OLD6}.tar.zst" "$DEPLOY/local-archive/aroi-${OLD6}.list"
+echo '{"m4b":2}' > "$DEPLOY/public/aroi_validation_${OLD6}02_000000.json"
+"$DEPLOY/scripts/upload-do.sh" "$DEPLOY/public" >/dev/null
+"$DEPLOY/scripts/upload-r2.sh" "$DEPLOY/public" >/dev/null
+
+# If remote _backups/ cannot be listed when local files are missing, compress-old-data must abort before overwriting
+if MOCK_RCLONE_FAIL_PATTERN="lsf aroi-r2:test-bucket/_backups/" "$DEPLOY/scripts/compress-old-data.sh" --month "$OLD6" >/dev/null 2>&1; then
+    fail "compress-old-data.sh must fail when local history absent and R2 _backups/ unreachable"
+else
+    pass "compress-old-data.sh refused build when local history absent and remote unreachable"
+fi
+assert_file_missing "$DEPLOY/local-archive/aroi-${OLD6}.tar.zst" "did not build partial local archive on unreachable remote check"
+
+# When remote _backups/ is reachable, recovers m4a + merges m4b without losing m4a
+"$DEPLOY/scripts/compress-old-data.sh" --month "$OLD6" >/dev/null
+assert_eq "$(wc -l < "$DEPLOY/local-archive/aroi-${OLD6}.list" | tr -d '[:space:]')" "2" "recovered pruned m4a from remote backup when both local artifacts were absent"
+assert_file_missing "$DEPLOY/public/aroi_validation_${OLD6}02_000000.json" "$OLD6 repaired and pruned cleanly"
+
+echo "=== 24. Content conflict on overlapping filename retains public file ==="
+# Put modified payload under already-archived m4a filename in public/
+echo '{"m4a":"mutated-v2"}' > "$DEPLOY/public/aroi_validation_${OLD6}01_000000.json"
+if "$DEPLOY/scripts/compress-old-data.sh" --month "$OLD6" >/dev/null 2>&1; then
+    fail "compress-old-data.sh must reject conflicting payload under archived filename"
+else
+    pass "compress-old-data.sh rejected conflicting payload on archive reuse/merge"
+fi
+assert_eq "$(cat "$DEPLOY/public/aroi_validation_${OLD6}01_000000.json")" '{"m4a":"mutated-v2"}' "conflicting public file preserved unpruned"
+rm -f "$DEPLOY/public/aroi_validation_${OLD6}01_000000.json"
+"$DEPLOY/scripts/verify-sync.sh" --fix --verify-zstd >/dev/null
+
+echo "=== 25. Concurrent replacement between snapshot and cleanup retains newer public generation ==="
+OLD7="202603"
+echo '{"gen":1}' > "$DEPLOY/public/aroi_validation_${OLD7}01_000000.json"
+"$DEPLOY/scripts/upload-do.sh" "$DEPLOY/public" >/dev/null
+"$DEPLOY/scripts/upload-r2.sh" "$DEPLOY/public" >/dev/null
+HOOK_BIN="$WORK/hook-bin"
+mkdir -p "$HOOK_BIN"
+cat > "$HOOK_BIN/rclone" <<EOF
+#!/usr/bin/env bash
+if [[ "\$*" == *"_backups"* && ! -f "$WORK/hook-ran" ]]; then
+    touch "$WORK/hook-ran"
+    printf '{"gen":2}\n' > "$DEPLOY/public/.aroi-tmp.hook"
+    mv -f "$DEPLOY/public/.aroi-tmp.hook" "$DEPLOY/public/aroi_validation_${OLD7}01_000000.json"
+fi
+exec "$MOCK_BIN/rclone" "\$@"
+EOF
+chmod +x "$HOOK_BIN/rclone"
+sed "s|^RCLONE_PATH=.*|RCLONE_PATH=$HOOK_BIN/rclone|" "$DEPLOY/config.env" > "$DEPLOY/config.env.new"
+mv -f "$DEPLOY/config.env.new" "$DEPLOY/config.env" && chmod 600 "$DEPLOY/config.env"
+if "$DEPLOY/scripts/compress-old-data.sh" --month "$OLD7" >/dev/null 2>&1; then
+    sed "s|^RCLONE_PATH=.*|RCLONE_PATH=$MOCK_BIN/rclone|" "$DEPLOY/config.env" > "$DEPLOY/config.env.new"
+    mv -f "$DEPLOY/config.env.new" "$DEPLOY/config.env" && chmod 600 "$DEPLOY/config.env"
+    fail "compress-old-data.sh must retain file replaced after snapshot and fail cleanup"
+else
+    sed "s|^RCLONE_PATH=.*|RCLONE_PATH=$MOCK_BIN/rclone|" "$DEPLOY/config.env" > "$DEPLOY/config.env.new"
+    mv -f "$DEPLOY/config.env.new" "$DEPLOY/config.env" && chmod 600 "$DEPLOY/config.env"
+    pass "compress-old-data.sh detected generation change after snapshot"
+fi
+assert_eq "$(cat "$DEPLOY/public/aroi_validation_${OLD7}01_000000.json")" '{"gen":2}' "newer file generation preserved in public/"
+# Align archives/buckets by cleaning test gen2 conflict cleanly back to valid state
+rm -f "$DEPLOY/public/aroi_validation_${OLD7}01_000000.json"
+"$DEPLOY/scripts/verify-sync.sh" --fix --verify-zstd >/dev/null
+
+echo "=== 26. Zero-byte local file already listed in .list repaired from remote when tarball corrupt/absent ==="
+: > "$DEPLOY/public/aroi_validation_${OLD7}01_000000.json"
+mv "$DEPLOY/local-archive/aroi-${OLD7}.tar.zst" "$WORK/saved-old7.tar.zst"
+"$DEPLOY/scripts/verify-sync.sh" --fix >/dev/null || true  # archive missing error expected, but local 0-byte must be repaired!
+local_old7_sz=$(wc -c < "$DEPLOY/public/aroi_validation_${OLD7}01_000000.json" | tr -d '[:space:]')
+assert_eq "$local_old7_sz" "10" "verify-sync.sh --fix repaired 0-byte local file listed in .list via remote bucket"
+mv "$WORK/saved-old7.tar.zst" "$DEPLOY/local-archive/aroi-${OLD7}.tar.zst"
+rm -f "$DEPLOY/public/aroi_validation_${OLD7}01_000000.json"
+
+echo "=== 27. Manifest-only month flagged & corrupt local tarball never overwrites remote backup ==="
+printf 'aroi_validation_20250201_000000.json\n' > "$DEPLOY/local-archive/aroi-202502.list"
+if "$DEPLOY/scripts/verify-sync.sh" --verify-zstd >/dev/null 2>&1; then
+    fail "verify-sync.sh --verify-zstd must flag manifest-only month without .tar.zst"
+else
+    pass "verify-sync.sh --verify-zstd detected manifest-only month without .tar.zst"
+fi
+rm -f "$DEPLOY/local-archive/aroi-202502.list"
+
+# Corrupt local tarball for OLD7 while mocking healthy remote tarball -> --fix must NOT overwrite remote backup!
+cp "$DEPLOY/local-archive/aroi-${OLD7}.tar.zst" "$WORK/good-old7.tar.zst"
+printf 'bad-zst' > "$DEPLOY/local-archive/aroi-${OLD7}.tar.zst"
+if "$DEPLOY/scripts/verify-sync.sh" --fix >/dev/null 2>&1; then
+    fail "verify-sync.sh --fix must fail on corrupt local tarball"
+else
+    pass "verify-sync.sh --fix failed on corrupt local tarball without --verify-zstd"
+fi
+assert_eq "$(wc -c < "$MOCK_ROOT/do/test-bucket/_backups/aroi-${OLD7}.tar.zst" | tr -d '[:space:]')" \
+    "$(wc -c < "$WORK/good-old7.tar.zst" | tr -d '[:space:]')" \
+    "corrupt local tarball did not overwrite healthy remote backup"
+mv "$WORK/good-old7.tar.zst" "$DEPLOY/local-archive/aroi-${OLD7}.tar.zst"
+
+# Repair valid same-size/content-mismatched backup uses --ignore-times via --repair-backups
+sed '1s/_000000\.json$/_000001.json/' "$MOCK_ROOT/r2/test-bucket/_backups/aroi-${OLD7}.list" > "$WORK/tamper-old7.list"
+cp "$WORK/tamper-old7.list" "$MOCK_ROOT/r2/test-bucket/_backups/aroi-${OLD7}.list"
+: > "$MOCK_LOG"
+"$DEPLOY/scripts/verify-sync.sh" --fix --verify-zstd >/dev/null
+if grep -q -- "--ignore-times" "$MOCK_LOG"; then
+    pass "verify-sync.sh --fix invoked --ignore-times repair path for mismatched backup"
+else
+    fail "verify-sync.sh --fix did not pass --ignore-times for mismatched backup"
+fi
+
+echo "=== 28. Multi-document files.json rejected & rebuilt cleanly by verify-sync.sh --fix ==="
+printf '["aroi_validation_20261101_010000.json"] ["aroi_validation_20261121_090500.json"]\n' > "$DEPLOY/public/files.json"
+if "$DEPLOY/scripts/verify-sync.sh" >/dev/null 2>&1; then
+    fail "verify-sync.sh must reject multi-document files.json"
+else
+    pass "verify-sync.sh rejected multi-document files.json"
+fi
+"$DEPLOY/scripts/verify-sync.sh" --fix --verify-zstd >/dev/null
+if jq -se 'length == 1 and (.[0] | type == "array")' "$DEPLOY/public/files.json" >/dev/null 2>&1; then
+    pass "verify-sync.sh --fix rebuilt multi-document files.json as single array"
+else
+    fail "files.json still malformed after verify-sync.sh --fix"
 fi
 
 echo ""

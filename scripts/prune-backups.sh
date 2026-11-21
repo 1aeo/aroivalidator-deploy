@@ -82,14 +82,16 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Validate argument/environment integers without Bash arithmetic overflow
-if ! KEEP_LEGACY_BACKUPS=$(parse_int_in_range "$KEEP_LEGACY_BACKUPS" 0 3650); then
-    echo "ERROR: invalid KEEP_LEGACY_BACKUPS='$KEEP_LEGACY_BACKUPS' (expected integer 0-3650)" >&2
+raw_keep=$KEEP_LEGACY_BACKUPS
+if ! KEEP_LEGACY_BACKUPS=$(parse_int_in_range "$raw_keep" 0 3650); then
+    echo "ERROR: invalid KEEP_LEGACY_BACKUPS='$raw_keep' (expected integer 0-3650)" >&2
     exit 2
 fi
 
 if [[ -n "$TPSLIMIT" ]]; then
-    if ! TPSLIMIT=$(parse_int_in_range "$TPSLIMIT" 1 10000); then
-        echo "ERROR: invalid DO_PURGE_TPSLIMIT/tpslimit='$TPSLIMIT' (expected integer 1-10000)" >&2
+    raw_tps=$TPSLIMIT
+    if ! TPSLIMIT=$(parse_int_in_range "$raw_tps" 1 10000); then
+        echo "ERROR: invalid DO_PURGE_TPSLIMIT/tpslimit='$raw_tps' (expected integer 1-10000)" >&2
         exit 2
     fi
 fi

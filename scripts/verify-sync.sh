@@ -69,6 +69,18 @@ list_local_zero() {
     )
 }
 
+# List sorted unique YYYYMM backup months having either a .tar.zst or .list in ARCHIVE_DIR
+list_local_backup_months() {
+    [[ -d "$ARCHIVE_DIR" ]] || return 0
+    (
+        cd "$ARCHIVE_DIR"
+        find . -maxdepth 1 \( -name 'aroi-*.tar.zst' -o -name 'aroi-*.list' \) -type f 2>/dev/null \
+            | sed -E 's#^\./aroi-([0-9]{6})\.(tar\.zst|list)$#\1#' \
+            | { grep -E '^[0-9]{6}$' || true; } \
+            | LC_ALL=C sort -u
+    )
+}
+
 # Collect local expected dataset from local-archive/*.list + non-empty public/*.json
 collect_local_expected() {
     {
@@ -122,7 +134,7 @@ install_missing_or_empty_local() {
 
     while IFS= read -r fn; do
         [[ "$fn" =~ $AROI_JSON_REGEX ]] || continue
-        [[ -s "$src_dir/$fn" ]] || continue
+        [[ -f "$src_dir/$fn" && ! -L "$src_dir/$fn" && -s "$src_dir/$fn" ]] || continue
         if [[ ! -e "$PUBLIC_DIR/$fn" || ! -s "$PUBLIC_DIR/$fn" ]]; then
             if atomic_install_file "$src_dir/$fn" "$PUBLIC_DIR/$fn" 644; then
                 installed=$((installed + 1))
@@ -150,13 +162,20 @@ repair_local_from_sources() {
         providers+=("r2"); buckets+=("$R2_BUCKET_URI"); live_files+=("$WORK/r2-live.txt")
     fi
 
+    list_local_zero > "$WORK/local-zero-init.txt"
+
     local idx prov bucket live_file extra ec dl_dir
     for idx in "${!providers[@]}"; do
         prov="${providers[$idx]}"
         bucket="${buckets[$idx]}"
         live_file="${live_files[$idx]}"
         extra="$WORK/extra-${prov}.txt"
-        comm -13 "$WORK/local-expected.txt" "$live_file" > "$extra"
+        {
+            comm -13 "$WORK/local-expected.txt" "$live_file"
+            if [[ -s "$WORK/local-zero-init.txt" ]]; then
+                comm -12 "$WORK/local-zero-init.txt" "$live_file"
+            fi
+        } | LC_ALL=C sort -u > "$extra"
         [[ -s "$extra" ]] || continue
         ec=$(wc -l < "$extra" | tr -d '[:space:]')
         echo "  → Downloading $ec file(s) missing locally (or replacing 0-byte local copies) from $prov to public/..."
@@ -169,6 +188,7 @@ repair_local_from_sources() {
         fi
         rm -rf "$dl_dir"
         collect_local_expected
+        list_local_zero > "$WORK/local-zero-init.txt"
     done
 
     # Also attempt recovering any remaining 0-byte local files from local-archive/*.tar.zst
@@ -196,7 +216,9 @@ repair_local_from_sources() {
             zstd -dc --long="$ZSTD_DEC_LONG" "$zst" 2>/dev/null | tar -C "$ext_dir" -xf - -T "$present_ym" 2>/dev/null || rc=$?
             if [[ $rc -eq 0 ]]; then
                 while IFS= read -r fn; do
-                    [[ -s "$ext_dir/$fn" ]] || rm -f "$ext_dir/$fn"
+                    if [[ ! -f "$ext_dir/$fn" || -L "$ext_dir/$fn" || ! -s "$ext_dir/$fn" ]]; then
+                        rm -f "$ext_dir/$fn"
+                    fi
                 done < "$present_ym"
                 install_missing_or_empty_local "$ext_dir" "$present_ym" || ERRORS=$((ERRORS + 1))
             else
@@ -250,7 +272,7 @@ backfill_remote_live() {
                 if [[ $rc -eq 0 ]]; then
                     while IFS= read -r fn; do
                         [[ -z "$fn" ]] && continue
-                        if [[ -s "$ext_dir/$fn" ]]; then
+                        if [[ -f "$ext_dir/$fn" && ! -L "$ext_dir/$fn" && -s "$ext_dir/$fn" ]]; then
                             mv -f "$ext_dir/$fn" "$stage/$fn"
                         fi
                     done < "$want_present"
@@ -271,7 +293,9 @@ backfill_remote_live() {
             printf '%s\n' "${need_from_remote[@]}" > "$dl_list"
             if "$RCLONE" copy "$source_bucket" "$peer_dir" --files-from "$dl_list" --no-traverse; then
                 for fn in "${need_from_remote[@]}"; do
-                    [[ -s "$peer_dir/$fn" ]] && mv -f "$peer_dir/$fn" "$stage/$fn"
+                    if [[ -f "$peer_dir/$fn" && ! -L "$peer_dir/$fn" && -s "$peer_dir/$fn" ]]; then
+                        mv -f "$peer_dir/$fn" "$stage/$fn"
+                    fi
                 done
             fi
             rm -rf "$peer_dir"
@@ -337,28 +361,24 @@ elif [[ -n "$local_zero" ]]; then
     echo "⚠ Local public/ contains 0-byte JSON(s); attempting repair..."
 fi
 
-# 2. Local zstd integrity (optional --verify-zstd)
-if $VERIFY_ZSTD; then
-    while IFS= read -r -d '' zst; do
-        base=$(basename "$zst")
-        ym=${base#aroi-}
-        ym=${ym%.tar.zst}
-        lst="$ARCHIVE_DIR/aroi-${ym}.list"
-        if ! zstd -t --long="$ZSTD_DEC_LONG" "$zst" >/dev/null 2>&1; then
-            echo "✗ Corrupt zstd archive: $base"
-            ERRORS=$((ERRORS + 1))
-            continue
-        fi
-        if ! list_archive_members "$zst" "$WORK/zst-actual-${ym}.txt"; then
-            echo "✗ Failed reading archive members from $base"
-            ERRORS=$((ERRORS + 1))
-            continue
-        fi
-        if [[ ! -s "$lst" ]] || ! cmp -s "$lst" "$WORK/zst-actual-${ym}.txt"; then
-            echo "✗ Manifest mismatch for $base vs aroi-${ym}.list"
+# 2. Validate local monthly backup pairs (always before remote backup repair; also under --verify-zstd)
+validate_local_backup_pairs() {
+    : > "$WORK/valid-backup-months.txt"
+    local ym
+    while IFS= read -r ym; do
+        [[ -z "$ym" ]] && continue
+        if verify_local_backup_pair "$ARCHIVE_DIR" "$ym" "$WORK"; then
+            echo "$ym" >> "$WORK/valid-backup-months.txt"
+        else
             ERRORS=$((ERRORS + 1))
         fi
-    done < <(find "$ARCHIVE_DIR" -maxdepth 1 -name 'aroi-*.tar.zst' -type f -print0 2>/dev/null)
+    done < <(list_local_backup_months)
+}
+
+if $VERIFY_ZSTD || [[ "$DO_ENABLED" == "true" || "$R2_ENABLED" == "true" ]]; then
+    validate_local_backup_pairs
+else
+    : > "$WORK/valid-backup-months.txt"
 fi
 
 collect_local_expected
@@ -469,38 +489,43 @@ check_provider_parity() {
         fi
     fi
 
-    # Verify zstd backup archives & .list manifests in $bucket/_backups/ using shared helper
-    local backup_mismatch=false zst base ym
-    while IFS= read -r -d '' zst; do
-        base=$(basename "$zst")
-        ym=${base#aroi-}
-        ym=${ym%.tar.zst}
+    # Verify valid local zstd backup archives & .list manifests in $bucket/_backups/
+    # (corrupt/incomplete local pairs were skipped in validate_local_backup_pairs so healthy remote copies stay safe)
+    local -a mismatched_months=()
+    local ym
+    while IFS= read -r ym; do
+        [[ -z "$ym" ]] && continue
         if ! verify_remote_backup_pair "$RCLONE" "$name" "$bucket" "$ym" "$ARCHIVE_DIR" "$backups_file" "$WORK"; then
-            backup_mismatch=true
+            mismatched_months+=("$ym")
         fi
-    done < <(find "$ARCHIVE_DIR" -maxdepth 1 -name 'aroi-*.tar.zst' -type f -print0 2>/dev/null)
+    done < "$WORK/valid-backup-months.txt"
 
-    if [[ "$backup_mismatch" == "true" ]]; then
+    if (( ${#mismatched_months[@]} > 0 )); then
         if $FIX_MODE; then
-            local name_lower upload_script
+            local name_lower upload_script repair_failed=false
             name_lower=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')
             upload_script="$SCRIPT_DIR/upload-${name_lower}.sh"
-            if [[ -x "$upload_script" ]] && "$upload_script" --upload-backups; then
-                local recheck_bk="$WORK/recheck-${name_lower}-backups.txt"
-                if "$RCLONE" lsf "$bucket/_backups/" --max-depth 1 --files-only --format shp > "$recheck_bk" 2>/dev/null; then
-                    while IFS= read -r -d '' zst; do
-                        base=$(basename "$zst")
-                        ym=${base#aroi-}
-                        ym=${ym%.tar.zst}
-                        if ! verify_remote_backup_pair "$RCLONE" "$name" "$bucket" "$ym" "$ARCHIVE_DIR" "$recheck_bk" "$WORK"; then
-                            ERRORS=$((ERRORS + 1))
-                        fi
-                    done < <(find "$ARCHIVE_DIR" -maxdepth 1 -name 'aroi-*.tar.zst' -type f -print0 2>/dev/null)
-                else
-                    ERRORS=$((ERRORS + 1))
-                fi
-            else
+            if [[ ! -x "$upload_script" ]]; then
                 ERRORS=$((ERRORS + 1))
+            else
+                for ym in "${mismatched_months[@]}"; do
+                    if ! "$upload_script" --repair-backups "$ym"; then
+                        ERRORS=$((ERRORS + 1))
+                        repair_failed=true
+                    fi
+                done
+                if [[ "$repair_failed" != "true" ]]; then
+                    local recheck_bk="$WORK/recheck-${name_lower}-backups.txt"
+                    if "$RCLONE" lsf "$bucket/_backups/" --max-depth 1 --files-only --format shp > "$recheck_bk" 2>/dev/null; then
+                        for ym in "${mismatched_months[@]}"; do
+                            if ! verify_remote_backup_pair "$RCLONE" "$name" "$bucket" "$ym" "$ARCHIVE_DIR" "$recheck_bk" "$WORK"; then
+                                ERRORS=$((ERRORS + 1))
+                            fi
+                        done
+                    else
+                        ERRORS=$((ERRORS + 1))
+                    fi
+                fi
             fi
         else
             ERRORS=$((ERRORS + 1))
@@ -519,14 +544,14 @@ if [[ "$R2_SCAN_OK" == "true" ]]; then
     check_provider_parity "R2" "$R2_BUCKET_URI" "$WORK/r2-live.txt" "$WORK/r2-zero.txt" "$WORK/r2-backups.txt" "$peer"
 fi
 
-# 5. Validate public/files.json schema (JSON array of canonical filenames) and membership
+# 5. Validate public/files.json as a single JSON array document of unique canonical filenames
 files_json_valid=false
 : > "$WORK/files-json.txt"
 if [[ -s "$PUBLIC_DIR/files.json" ]] \
-    && jq -e --arg re "$AROI_JSON_REGEX" \
-        'type == "array" and all(.[]; (type == "string") and test($re)) and (length == (unique | length))' \
+    && jq -se --arg re "$AROI_JSON_REGEX" \
+        'length == 1 and (.[0] | type == "array" and all(.[]; (type == "string") and test($re)) and (length == (unique | length)))' \
         "$PUBLIC_DIR/files.json" >/dev/null 2>&1; then
-    jq -r '.[]' "$PUBLIC_DIR/files.json" | LC_ALL=C sort -u > "$WORK/files-json.txt"
+    jq -rs '.[0][]' "$PUBLIC_DIR/files.json" | LC_ALL=C sort -u > "$WORK/files-json.txt"
     files_json_valid=true
 fi
 
